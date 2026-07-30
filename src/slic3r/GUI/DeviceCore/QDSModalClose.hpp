@@ -2,9 +2,10 @@
 #define slic3r_GUI_DeviceCore_QDSModalClose_hpp_
 
 #include <wx/dialog.h>
-#include <wx/popupwin.h>
 #include <wx/timer.h>
 #include <wx/weakref.h>
+
+#include "../Widgets/TransientWindowCleanup.hpp"
 
 namespace Slic3r { namespace GUI {
 
@@ -34,8 +35,7 @@ public:
             return false;
 
         m_closing = true;
-        if (popup && popup->IsShown())
-            popup->Dismiss();
+        dismiss_transient_popup(popup);
         if (timer)
             timer->Stop();
         if (primary_action)

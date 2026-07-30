@@ -645,6 +645,9 @@ public:
 
 
 private:
+    void dismiss_transient_popups();
+    void destroy_timelapse_storage_popup();
+    void on_timelapse_storage_popup_show(wxShowEvent &event);
     void EnableEditing(bool enable);
 
     // printing

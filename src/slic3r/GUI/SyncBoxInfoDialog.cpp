@@ -4,7 +4,6 @@
 #include <wx/event.h>
 #include <wx/sizer.h>
 #include <wx/slider.h>
-#include <wx/weakref.h>
 #include <wx/dcmemory.h>
 #include "GUI_App.hpp"
 #include "Tab.hpp"
@@ -64,7 +63,8 @@ bool SyncBoxInfoDialog::Show(bool show)
     } else {
         if (m_refresh_timer)
             m_refresh_timer->Stop();
-        return DPIDialog::Show(false);
+        return hide_window_after_dismissing_transients(
+            {&m_mapping_popup}, [this]() { return DPIDialog::Show(false); });
     }
     // set default value when show this dialog
     wxGetApp().UpdateDlgDarkUI(this);
@@ -202,6 +202,8 @@ void SyncBoxInfoDialog::show_sizer(wxSizer *sizer, bool show)
 
 void SyncBoxInfoDialog::deal_ok()
 {
+    m_result.qds_snapshot_generation = m_qds_device.expired() ? 0 : m_qds_mapping_generation;
+
     if (!m_is_empty_project) {
         if (m_map_mode == MapModeEnum::Override || !m_result.is_same_printer) {
             m_is_empty_project = true;
@@ -244,12 +246,32 @@ bool SyncBoxInfoDialog::is_need_show()
 {
     //init begin
     m_result.direct_sync = true;
+    m_result.is_same_printer = true;
     m_result.sync_maps.clear();
+    m_result.qds_snapshot_generation = 0;
+    m_qds_mapping_generation = 0;
     m_generate_fix_sizer_ams_mapping = false;
     m_ams_combo_info.clear();
     // init end
     check_empty_project();
-    if (m_is_empty_project && !is_dirty_filament()) {
+
+    bool qds_direct_sync_ready = true;
+    if (const auto qds_device = m_qds_device.lock()) {
+        const auto box_state = qds_device->getBoxMappingState();
+        const bool profile_compatible = get_printer_preset(qds_device) != nullptr;
+        const auto direct_sync = QDSBoxSync::prepare_direct_sync(
+            box_state.ready, profile_compatible, box_state.generation);
+        m_result.is_same_printer = profile_compatible;
+        m_qds_mapping_generation = direct_sync.generation;
+        m_result.qds_snapshot_generation = direct_sync.generation;
+        qds_direct_sync_ready = direct_sync.can_skip_dialog;
+        if (!qds_direct_sync_ready) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+                                       << ": QDS direct synchronization requires a ready snapshot and compatible profile";
+        }
+    }
+
+    if (m_is_empty_project && !is_dirty_filament() && qds_direct_sync_ready) {
         return false;
     }
     auto mode = PageType::ptColorMap;
@@ -1008,6 +1030,8 @@ SyncBoxInfoDialog::SyncBoxInfoDialog(wxWindow *parentm, SyncInfo& info) :
         m_button_ok->Bind(wxEVT_COMMAND_BUTTON_CLICKED, [this](wxCommandEvent &e) {
             if (m_modal_close.closing())
                 return;
+            if (!validate_qds_mapping_before_sync())
+                return;
             deal_ok();
             request_modal_close(wxID_YES);
         });
@@ -1226,6 +1250,16 @@ bool SyncBoxInfoDialog::do_ams_mapping(MachineObject* obj_)
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " begin do_box_mapping result";
     const auto qds_device = m_qds_device.lock();
     const bool qds_mode = static_cast<bool>(qds_device);
+    m_qds_mapping_generation = 0;
+    if (qds_device) {
+        const auto box_state = qds_device->getBoxMappingState();
+        if (!box_state.ready) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+                                       << ": QDS Box mapping snapshot is not ready";
+            return false;
+        }
+        m_qds_mapping_generation = box_state.generation;
+    }
     const std::string qds_device_id = qds_device ? qds_device->m_id : std::string{};
 
     m_cur_colors_in_thumbnail.clear();
@@ -1318,42 +1352,65 @@ void SyncBoxInfoDialog::apply_persisted_mappings()
         const int project_filament = entry.first;
         const QDSBoxSync::MappingPreference &preference = entry.second;
         if (!wxGetApp().preset_bundle || project_filament < 0 ||
-            static_cast<size_t>(project_filament) >= wxGetApp().preset_bundle->filament_presets.size() ||
-            wxGetApp().preset_bundle->filament_presets[project_filament] != preference.project_preset) {
+            static_cast<size_t>(project_filament) >= wxGetApp().preset_bundle->filament_presets.size()) {
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": ignored mapping for a changed project filament "
                                     << project_filament;
             continue;
         }
 
-        const Preset *project_preset = wxGetApp().preset_bundle->filaments.find_preset(preference.project_preset);
-        const int slot_index = preference.slot_index;
-        const std::string &preset_id = preference.slot_preset_id;
+        auto result = std::find_if(m_ams_mapping_result.begin(), m_ams_mapping_result.end(),
+                                   [project_filament](const FilamentInfo &info) { return info.id == project_filament; });
+        if (result == m_ams_mapping_result.end())
+            continue;
+
+        const std::string &project_preset_name = wxGetApp().preset_bundle->filament_presets[project_filament];
+        const Preset *project_preset = wxGetApp().preset_bundle->filaments.find_preset(project_preset_name);
         if (!project_preset ||
-            !QDSBoxSync::mapping_preference_is_current(box_state.snapshot, preference,
-                                                       project_preset->filament_id)) {
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": ignored stale mapping for project filament " << project_filament;
+            !QDSBoxSync::apply_mapping_preference(*result, box_state.snapshot, preference,
+                                                  project_preset_name, project_preset->filament_id)) {
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": ignored stale mapping for project filament "
+                                    << project_filament;
             continue;
         }
 
-        auto result = std::find_if(m_ams_mapping_result.begin(), m_ams_mapping_result.end(),
-                                   [project_filament](const FilamentInfo &info) { return info.id == project_filament; });
-        auto slot = std::find_if(box_state.snapshot.slots.begin(), box_state.snapshot.slots.end(),
-                                 [slot_index](const QDSBoxSync::BoxSlotSnapshot &snapshot_slot) {
-                                     return snapshot_slot.slot_index == slot_index;
-                                 });
-        if (result == m_ams_mapping_result.end() || slot == box_state.snapshot.slots.end())
-            continue;
-
-        result->tray_id     = slot_index;
-        result->ams_id      = std::to_string(slot_index / QDSBoxSync::slots_per_box + 1);
-        result->slot_id     = std::to_string(slot_index);
-        result->filament_id = preset_id;
-        result->type        = slot->material_type.value_or("");
-        result->color       = slot->colour.value_or("#CECECE").substr(1) + "FF";
-        result->distance    = -1.0f;
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": restored project filament " << project_filament
-                                << " to Box slot " << slot_index << " with preset " << preset_id;
+                                << " to Box slot " << preference.slot_index
+                                << " with preset " << preference.slot_preset_id;
     }
+}
+
+bool SyncBoxInfoDialog::validate_qds_mapping_before_sync()
+{
+    const auto qds_device = m_qds_device.lock();
+    if (!qds_device)
+        return true;
+
+    const auto box_state = qds_device->getBoxMappingState();
+    if (!QDSBoxSync::mapping_generation_is_current(box_state.ready,
+                                                   m_qds_mapping_generation,
+                                                   box_state.generation)) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+                                   << ": QDS Box snapshot changed while the synchronization dialog was open";
+        update_ams_status_msg(_L("Box filament information changed. Please refresh and review the mappings."), true);
+        return false;
+    }
+
+    const bool mapping_required = !m_is_empty_project &&
+                                  m_map_mode != MapModeEnum::Override &&
+                                  m_result.is_same_printer;
+    if (mapping_required) {
+        const auto validation = QDSBoxSync::validate_mapping_result(box_state.snapshot,
+                                                                    m_ams_mapping_result);
+        if (!validation.valid) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+                                       << ": rejected invalid QDS Box mapping at confirmation: "
+                                       << validation.reason;
+            update_ams_status_msg(_L("The filament mapping is no longer valid. Please review the Box slots."), true);
+            return false;
+        }
+    }
+
+    return true;
 }
 
 void SyncBoxInfoDialog::deal_only_exist_ext_spool() {
@@ -1959,6 +2016,7 @@ bool SyncBoxInfoDialog::is_same_nozzle_type(std::string &filament_type, NozzleTy
 
     DeviceManager *dev = Slic3r::GUI::wxGetApp().getDeviceManager();
     if (!dev) return true;
+    MachineObject *obj_ = dev->get_selected_machine();
 
     if (obj_ == nullptr) return true;
 
@@ -1994,6 +2052,7 @@ bool SyncBoxInfoDialog::is_same_printer_model()
     DeviceManager *dev    = Slic3r::GUI::wxGetApp().getDeviceManager();
     if (!dev) return result;
 
+    MachineObject *obj_ = dev->get_selected_machine();
 
     if (obj_ == nullptr) { return result; }
 
@@ -2076,64 +2135,98 @@ void SyncBoxInfoDialog::on_refresh(wxCommandEvent &event)
 
 void SyncBoxInfoDialog::on_set_finish_mapping(wxCommandEvent &evt)
 {
-    auto selection_data     = evt.GetString();
-    auto selection_data_arr = wxSplit(selection_data.ToStdString(), '|');
+    const auto selection_data_arr = wxSplit(evt.GetString().ToStdString(), '|');
+    if (selection_data_arr.size() != 8)
+        return;
 
-    BOOST_LOG_TRIVIAL(info) << "The box mapping selection result: data is " << selection_data;
+    const int project_filament_id = wxAtoi(selection_data_arr[5]);
+    const std::string selected_ams_id = selection_data_arr[6].ToStdString();
+    const std::string selected_slot_id = selection_data_arr[7].ToStdString();
+    MappingItem *selected_item = m_mapping_popup.find_mapping_item(
+        evt.GetInt(), wxAtoi(selection_data_arr[6]), wxAtoi(selection_data_arr[7]));
+    int ctype = 0;
+    std::vector<wxColour> material_cols;
+    std::vector<std::string> tray_cols;
+    if (selected_item) {
+        ctype = selected_item->m_tray_data.ctype;
+        material_cols = selected_item->m_tray_data.material_cols;
+        for (const auto &col : selected_item->m_tray_data.material_cols) {
+            tray_cols.push_back(wxString::Format("#%02X%02X%02X%02X", col.Red(), col.Green(),
+                                                 col.Blue(), col.Alpha()).ToStdString());
+        }
+    }
 
-    if (selection_data_arr.size() == 8) {
-        auto ams_colour      = wxColour(wxAtoi(selection_data_arr[0]), wxAtoi(selection_data_arr[1]), wxAtoi(selection_data_arr[2]), wxAtoi(selection_data_arr[3]));
-        int  old_filament_id = (int) wxAtoi(selection_data_arr[5]);
-        if (m_print_type == PrintFromType::FROM_NORMAL) { // todo:support sd card
-            change_default_normal(old_filament_id, ams_colour);
-            final_deal_edge_pixels_data(m_preview_thumbnail_data);
-            set_default_normal(m_preview_thumbnail_data); // do't reset ams
-            if (!m_reset_all_btn->IsShown()) {
-                m_reset_all_btn->Show();
-                Layout();
-                Fit();
-            }
+    const auto target = std::find_if(m_ams_mapping_result.begin(), m_ams_mapping_result.end(),
+                                     [project_filament_id](const FilamentInfo &mapping) {
+                                         return mapping.id == project_filament_id;
+                                     });
+    if (target == m_ams_mapping_result.end()) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": ignored mapping for a missing project filament";
+        return;
+    }
+
+    FilamentInfo candidate = *target;
+    candidate.tray_id = evt.GetInt();
+    const wxColour event_colour(wxAtoi(selection_data_arr[0]), wxAtoi(selection_data_arr[1]),
+                                wxAtoi(selection_data_arr[2]), wxAtoi(selection_data_arr[3]));
+    candidate.color = wxString::Format("#%02X%02X%02X%02X", event_colour.Red(), event_colour.Green(),
+                                       event_colour.Blue(), event_colour.Alpha()).ToStdString().erase(0, 1);
+    candidate.ctype = ctype;
+    candidate.colors = tray_cols;
+    candidate.ams_id = selected_ams_id;
+    candidate.slot_id = selected_slot_id;
+
+    if (const auto qds_device = m_qds_device.lock()) {
+        const auto box_state = qds_device->getBoxMappingState();
+        if (!box_state.ready || !selected_item || !wxGetApp().preset_bundle || project_filament_id < 0 ||
+            static_cast<size_t>(project_filament_id) >= wxGetApp().preset_bundle->filament_presets.size()) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": rejected incomplete QDS mapping selection";
+            return;
+        }
+        const std::string &project_preset_name = wxGetApp().preset_bundle->filament_presets[project_filament_id];
+        const Preset *project_preset = wxGetApp().preset_bundle->filaments.find_preset(project_preset_name);
+        if (!project_preset) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": rejected mapping for an unavailable project preset";
+            return;
         }
 
-        int                      ctype = 0;
-        std::vector<wxColour>    material_cols;
-        std::vector<std::string> tray_cols;
-        for (auto mapping_item : m_mapping_popup.m_mapping_item_list) {
-            if (mapping_item->m_tray_data.id == evt.GetInt()) {
-                ctype         = mapping_item->m_tray_data.ctype;
-                material_cols = mapping_item->m_tray_data.material_cols;
-                for (auto col : mapping_item->m_tray_data.material_cols) {
-                    wxString color = wxString::Format("#%02X%02X%02X%02X", col.Red(), col.Green(), col.Blue(), col.Alpha());
-                    tray_cols.push_back(color.ToStdString());
-                }
-                break;
-            }
+        const TrayData &displayed = selected_item->m_tray_data;
+        QDSBoxSync::MappingSelection selection;
+        selection.tray_id = evt.GetInt();
+        selection.ams_id = selected_ams_id;
+        selection.slot_id = selected_slot_id;
+        selection.displayed_preset_id = displayed.filament_preset_id;
+        selection.displayed_material = displayed.filament_type;
+        selection.displayed_colour = wxString::Format("#%02X%02X%02X", displayed.colour.Red(),
+                                                       displayed.colour.Green(), displayed.colour.Blue()).ToStdString();
+        selection.project_preset_id = project_preset->filament_id;
+        selection.project_material = project_preset->config.opt_string("filament_type", 0u);
+        if (!QDSBoxSync::apply_mapping_selection(candidate, box_state.snapshot, selection)) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": rejected stale or incompatible QDS mapping selection";
+            return;
         }
+    }
 
-        for (auto i = 0; i < m_ams_mapping_result.size(); i++) {
-            if (m_ams_mapping_result[i].id == wxAtoi(selection_data_arr[5])) {
-                m_ams_mapping_result[i].tray_id = evt.GetInt();
-                auto     ams_colour = wxColour(wxAtoi(selection_data_arr[0]), wxAtoi(selection_data_arr[1]), wxAtoi(selection_data_arr[2]), wxAtoi(selection_data_arr[3]));
-                wxString color      = wxString::Format("#%02X%02X%02X%02X", ams_colour.Red(), ams_colour.Green(), ams_colour.Blue(), ams_colour.Alpha());
-                m_ams_mapping_result[i].color  = color.ToStdString();
-                m_ams_mapping_result[i].ctype  = ctype;
-                m_ams_mapping_result[i].colors = tray_cols;
-
-                m_ams_mapping_result[i].ams_id  = selection_data_arr[6].ToStdString();
-                m_ams_mapping_result[i].slot_id = selection_data_arr[7].ToStdString();
-            }
-            BOOST_LOG_TRIVIAL(info) << "The box mapping result: id is " << m_ams_mapping_result[i].id << "tray_id is " << m_ams_mapping_result[i].tray_id;
+    *target = candidate;
+    if (m_print_type == PrintFromType::FROM_NORMAL) { // todo:support sd card
+        const wxColour mapped_colour = DevAmsTray::decode_color(candidate.color);
+        change_default_normal(project_filament_id, mapped_colour);
+        final_deal_edge_pixels_data(m_preview_thumbnail_data);
+        set_default_normal(m_preview_thumbnail_data); // do't reset ams
+        if (!m_reset_all_btn->IsShown()) {
+            m_reset_all_btn->Show();
+            Layout();
+            Fit();
         }
+    }
 
-        MaterialHash::iterator iter = m_materialList.begin();
-        while (iter != m_materialList.end()) {
-            Material *    item = iter->second;
-            auto          m    = item->item;
-            if (item->id == m_current_filament_id) {
-                auto ams_colour = wxColour(wxAtoi(selection_data_arr[0]), wxAtoi(selection_data_arr[1]), wxAtoi(selection_data_arr[2]), wxAtoi(selection_data_arr[3]));
-                m->set_ams_info(ams_colour, selection_data_arr[4], ctype, material_cols);//finish
-            }
-            iter++;
+    for (auto iter = m_materialList.begin(); iter != m_materialList.end(); ++iter) {
+        Material *item = iter->second;
+        if (item->id == m_current_filament_id) {
+            const wxString material = selected_item ? from_u8(selected_item->m_tray_data.filament_type)
+                                                    : selection_data_arr[4];
+            item->item->set_ams_info(DevAmsTray::decode_color(candidate.color), material,
+                                     candidate.ctype, material_cols);
         }
     }
 }
@@ -2302,10 +2395,8 @@ void SyncBoxInfoDialog::update_show_status()
         return;
     }
 
-    if (!obj_) {
-        DeviceManager *dev = Slic3r::GUI::wxGetApp().getDeviceManager();
-        obj_ = dev ? dev->get_selected_machine() : nullptr;
-    }
+    DeviceManager *dev = Slic3r::GUI::wxGetApp().getDeviceManager();
+    MachineObject *obj_ = dev ? dev->get_selected_machine() : nullptr;
     if (!obj_) {
         show_status(PrintDialogStatus::PrintStatusInvalidPrinter);
         return;
@@ -2713,6 +2804,8 @@ void SyncBoxInfoDialog::reset_and_sync_ams_list()
             wxPoint rect      = item->ClientToScreen(wxPoint(0, 0));
 
             const auto &   full_config = wxGetApp().preset_bundle->full_config();
+            DeviceManager *dev_manager = Slic3r::GUI::wxGetApp().getDeviceManager();
+            MachineObject *obj_ = dev_manager ? dev_manager->get_selected_machine() : nullptr;
             size_t         nozzle_nums = full_config.option<ConfigOptionFloatsNullable>("nozzle_diameter")->values.size();
             bool           is_selector = false;
             if (nozzle_nums > 1) {
@@ -3235,6 +3328,7 @@ void SyncBoxInfoDialog::change_default_normal(int old_filament_id, wxColour temp
 }
 
 SyncBoxInfoDialog::~SyncBoxInfoDialog() {
+    dismiss_transient_popup(&m_mapping_popup);
     if (m_refresh_timer) {
         m_refresh_timer->Stop();
         Unbind(wxEVT_TIMER, &SyncBoxInfoDialog::on_timer, this);

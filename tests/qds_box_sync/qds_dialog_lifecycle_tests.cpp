@@ -5,6 +5,7 @@
 #include <wx/popupwin.h>
 #include <wx/button.h>
 #include <wx/timer.h>
+#include <wx/weakref.h>
 
 #include "slic3r/GUI/DeviceCore/QDSModalClose.hpp"
 
@@ -71,6 +72,103 @@ bool run_cycles(bool use_window_close, int requested_result = wxID_CANCEL)
     return passed && timer_events == events_after_close;
 }
 
+bool run_parent_hide_cycle()
+{
+    auto *dialog = new wxDialog(nullptr, wxID_ANY, "QDS transient cleanup");
+    auto *popup  = new wxPopupTransientWindow(dialog, wxBORDER_NONE);
+    popup->SetSize(wxSize(480, 165));
+
+    bool passed = true;
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        const bool dialog_shown = dialog->Show();
+        popup->Popup();
+        passed = passed && dialog_shown && popup->IsShown();
+        const bool parent_hidden = Slic3r::GUI::hide_window_after_dismissing_transients(
+            {popup}, [dialog]() { return dialog->Show(false); });
+        wxTheApp->ProcessPendingEvents();
+        passed = passed && parent_hidden && !dialog->IsShown() && !popup->IsShown();
+        passed = passed && !Slic3r::GUI::dismiss_transient_popup(popup);
+    }
+
+    popup->Destroy();
+    dialog->Destroy();
+    wxTheApp->ProcessPendingEvents();
+    return passed;
+}
+
+bool run_heap_popup_destroy_cycles()
+{
+    auto *dialog = new wxDialog(nullptr, wxID_ANY, "QDS heap popup cleanup");
+    bool passed = true;
+
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        auto *popup = new wxPopupTransientWindow(dialog, wxBORDER_NONE);
+        wxWeakRef<wxWindow> weak_popup(popup);
+        bool destroyed = false;
+        popup->Bind(wxEVT_DESTROY, [&destroyed](wxWindowDestroyEvent &event) {
+            destroyed = true;
+            event.Skip();
+        });
+        popup->SetSize(wxSize(480, 165));
+        dialog->Show();
+        popup->Popup();
+
+        passed = passed && popup->IsShown() &&
+                 Slic3r::GUI::destroy_transient_popup(popup) && popup == nullptr;
+        wxTheApp->ProcessPendingEvents();
+        wxTheApp->ProcessIdle();
+        wxTheApp->ProcessPendingEvents();
+        passed = passed && destroyed && !weak_popup;
+    }
+
+    dialog->Destroy();
+    wxTheApp->ProcessPendingEvents();
+    return passed;
+}
+
+bool run_nested_tooltip_destroy_cycle()
+{
+    auto *dialog = new wxDialog(nullptr, wxID_ANY, "QDS nested tooltip cleanup");
+    auto *owner = new wxPopupTransientWindow(dialog, wxBORDER_NONE);
+    // AmsMapingPopup has regular controls in addition to its native tooltip,
+    // so wxPopupTransientWindow captures itself rather than the tooltip.
+    auto *owner_content = new wxButton(owner, wxID_ANY, "Mapping");
+    auto *tooltip = new wxPopupWindow(owner, wxBORDER_NONE);
+    wxWeakRef<wxWindow> weak_owner(owner);
+    wxWeakRef<wxWindow> weak_tooltip(tooltip);
+    (void) owner_content;
+
+    dialog->Show();
+    owner->Popup();
+    tooltip->Show();
+    const bool shown = owner->IsShown() && tooltip->IsShown();
+
+    // Match AmsMapingPopup::Dismiss(): release transient capture before
+    // destroying and detaching the nested native top-level tooltip.
+    owner->Dismiss();
+    const bool cleanup_requested = Slic3r::GUI::destroy_transient_popup(tooltip);
+    bool late_event_ran = false;
+    bool tooltip_recreated = false;
+    wxTheApp->CallAfter([&]() {
+        late_event_ran = true;
+        if (Slic3r::GUI::can_show_transient_child(owner)) {
+            tooltip = new wxPopupWindow(owner, wxBORDER_NONE);
+            tooltip->Show();
+            tooltip_recreated = true;
+        }
+    });
+    wxTheApp->ProcessPendingEvents();
+    delete owner;
+    owner = nullptr;
+    dialog->Destroy();
+    wxTheApp->ProcessPendingEvents();
+    wxTheApp->ProcessIdle();
+    wxTheApp->ProcessPendingEvents();
+
+    return shown && cleanup_requested && late_event_ran && !tooltip_recreated &&
+           tooltip == nullptr && !weak_tooltip && !weak_owner;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -89,14 +187,18 @@ int main(int argc, char **argv)
     const bool cancel_passed = run_cycles(false);
     const bool close_passed  = run_cycles(true);
     const bool success_passed = run_cycles(false, wxID_YES);
+    const bool parent_hide_passed = run_parent_hide_cycle();
+    const bool heap_popup_destroy_passed = run_heap_popup_destroy_cycles();
+    const bool nested_tooltip_destroy_passed = run_nested_tooltip_destroy_cycle();
 
     wxTheApp->OnExit();
     wxEntryCleanup();
 
-    if (!cancel_passed || !close_passed || !success_passed) {
-        std::cerr << "QDS modal lifecycle cleanup failed\n";
+    if (!cancel_passed || !close_passed || !success_passed || !parent_hide_passed ||
+        !heap_popup_destroy_passed || !nested_tooltip_destroy_passed) {
+        std::cerr << "QDS dialog lifecycle cleanup failed\n";
         return 1;
     }
-    std::cout << "QDS modal lifecycle cleanup passed for cancel, window-close, and success paths\n";
+    std::cout << "QDS dialog lifecycle cleanup passed for cancel, window-close, success, parent-hide, and nested-tooltip paths\n";
     return 0;
 }

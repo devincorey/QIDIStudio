@@ -177,6 +177,7 @@ public:
         std::vector<std::string> filament_id;
         std::vector<int>         slot_id;
         std::vector<int>         slot_state;
+        std::uint64_t            generation{0};
     };
 public:
     QDSDevice(const std::string dev_id, const std::string& dev_name, const std::string& dev_ip, const std::string& dev_url, const std::string& dev_type);

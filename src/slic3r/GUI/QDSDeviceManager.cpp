@@ -944,7 +944,7 @@ void QDSDevice::updateBoxDataByJson(const json &status)
 		}
 
 		if (ignored_empty_slot_identity)
-			BOOST_LOG_TRIVIAL(info) << __FUNCTION__
+			BOOST_LOG_TRIVIAL(debug) << __FUNCTION__
 			                        << ": ignored identity metadata for empty slot " << i;
 
 		if (i < QDSBoxSync::max_box_slots) {
@@ -1466,7 +1466,7 @@ QDSDevice::BoxMappingState QDSDevice::getBoxMappingState()
 {
     std::lock_guard<std::mutex> lock(m_config_mtx);
     return {m_box_mapping_ready, m_box_count, m_box_snapshot, m_filament_colors, m_filament_type,
-            m_filament_id, m_slot_id, m_slot_state};
+            m_filament_id, m_slot_id, m_slot_state, m_box_snapshot_generation};
 }
 
 bool QDSDevice::publishBoxMappingState(const QDSBoxSync::BoxSnapshot &snapshot,
@@ -3070,13 +3070,17 @@ bool QDSDeviceManager::upBoxInfoToBoxMsg(std::shared_ptr<QDSDevice>& device){
         filament_id[index]     = slot.filament_preset_id.value_or("");
         filament_colors[index] = slot.colour.value_or("#CECECE");
         filament_type[index]   = slot.material_type.value_or("");
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": Box slot=" << slot.slot_index
+        BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ": Box slot=" << slot.slot_index
                                 << " preset_id=" << filament_id[index]
                                 << " material=" << slot.material_name.value_or(filament_type[index])
                                 << " colour=" << filament_colors[index];
     }
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": Box count=" << snapshot.box_count
+                            << " occupied_slots=" << snapshot.slots.size()
+                            << " external_spool=" << static_cast<bool>(snapshot.external_spool)
+                            << " loaded_slot=" << (snapshot.loaded_slot ? std::to_string(*snapshot.loaded_slot) : "none");
     if (snapshot.external_spool) {
-        constexpr size_t external_index = 16;
+        const size_t external_index = static_cast<size_t>(QDSBoxSync::external_spool_slot);
         slot_state[external_index]      = 1;
         slot_id[external_index]         = 16;
         filament_id[external_index]     = snapshot.external_spool->filament_preset_id.value_or("");

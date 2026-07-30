@@ -200,7 +200,7 @@ namespace Slic3r
         }
 
         //y78
-        constexpr size_t external_index = 16;
+        const size_t external_index = static_cast<size_t>(GUI::QDSBoxSync::external_spool_slot);
         if (!right_nozzle_has_ams && aligned_size > external_index &&
             slot_id[external_index] >= 0 && !filament_id[external_index].empty()) {
             FilamentInfo box_fila_info;
@@ -208,9 +208,9 @@ namespace Slic3r
             box_fila_info.color = colour.substr(1) + "FF";
             box_fila_info.type = filament_type[external_index];
             box_fila_info.filament_id = filament_id[external_index];
-            box_fila_info.slot_id = std::to_string(slot_id[external_index]);
-            box_fila_info.ams_id = "";
-            box_fila_info.tray_id = -1;
+            box_fila_info.slot_id = std::to_string(VIRTUAL_TRAY_MAIN_ID);
+            box_fila_info.ams_id = std::to_string(VIRTUAL_TRAY_MAIN_ID);
+            box_fila_info.tray_id = VIRTUAL_TRAY_MAIN_ID;
             box_filament_infos.push_back(box_fila_info);
         }
 
