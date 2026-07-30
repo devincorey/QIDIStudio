@@ -290,6 +290,7 @@ public:
     std::vector<MappingItem*> m_mapping_item_list;
 
     bool        m_has_unmatch_filament {false};
+    bool        m_has_external_spool{false};
     int         m_current_filament_id;
     ShowType    m_show_type{ShowType::RIGHT};
     std::string m_tag_material;
