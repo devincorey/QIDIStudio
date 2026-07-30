@@ -2496,6 +2496,10 @@ void PresetBundle::get_ams_cobox_infos(AMSComboInfo &combox_info, bool skip_ext)
                                  [this, &filament_id](auto &f) { return f.is_compatible && filaments.get_preset_base(f) == &f && f.filament_id == filament_id; });
         if (iter == filaments.end()) {
             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": filament_id %1% not found or system or compatible") % filament_id;
+            if (boost::algorithm::starts_with(filament_id, "QD_")) {
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": refusing generic fallback for exact QIDI filament id " << filament_id;
+                continue;
+            }
             auto filament_type = ams.opt_string("filament_type", 0u);
             if (!filament_type.empty()) {
                 filament_type = "Generic " + filament_type;
@@ -2603,12 +2607,18 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
             continue;
         }
         bool has_type = false;
+        const std::string requested_filament_id = filament_id;
         auto filament_type = ams.opt_string("filament_type", 0u);
         auto iter = std::find_if(filaments.begin(), filaments.end(), [this, &filament_id, &has_type, filament_type](auto &f) {
             has_type |= f.config.opt_string("filament_type", 0u) == filament_type;
             return f.is_compatible && filaments.get_preset_base(f) == &f && f.filament_id == filament_id; });
         if (iter == filaments.end()) {
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": filament_id %1% not found or system or compatible") % filament_id;
+            if (boost::algorithm::starts_with(requested_filament_id, "QD_")) {
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": refusing Generic/previous/random fallback for exact QIDI filament id " << requested_filament_id;
+                unknowns.emplace_back(&ams, L("The exact QIDI filament preset is unavailable or incompatible; no substitute preset was selected."));
+                continue;
+            }
             if (!filament_type.empty()) {
                 filament_type = "Generic " + filament_type;
                 iter = std::find_if(filaments.begin(), filaments.end(), [&filament_type](auto &f) {

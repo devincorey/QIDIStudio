@@ -117,6 +117,58 @@ static bool _HasAms(const std::vector<FilamentInfo>& ams_mapping_result) {
     return false;
 }
 
+using QdsMappingPreferences = std::map<int, std::pair<int, std::string>>;
+
+static std::string qds_mapping_persistence_key()
+{
+    auto *plater = wxGetApp().plater();
+    return plater ? plater->box_msg.box_list_preset_name : std::string{};
+}
+
+static QdsMappingPreferences load_qds_mapping_preferences(const std::string &key)
+{
+    QdsMappingPreferences preferences;
+    if (key.empty() || !wxGetApp().app_config)
+        return preferences;
+
+    const std::string stored_json = wxGetApp().app_config->get("ams_filament_ids", key);
+    if (stored_json.empty() || stored_json.front() != '{')
+        return preferences;
+
+    try {
+        const json stored = json::parse(stored_json);
+        if (stored.value("version", 0) != 1 || !stored.contains("mappings") || !stored["mappings"].is_array())
+            return preferences;
+        for (const auto &entry : stored["mappings"]) {
+            if (!entry.is_object() || !entry.contains("project_filament") || !entry.contains("slot") ||
+                !entry.contains("preset_id") || !entry["project_filament"].is_number_integer() ||
+                !entry["slot"].is_number_integer() || !entry["preset_id"].is_string())
+                continue;
+            preferences[entry["project_filament"].get<int>()] = {
+                entry["slot"].get<int>(), entry["preset_id"].get<std::string>()};
+        }
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": ignored malformed persisted QDS mapping: " << e.what();
+    }
+    return preferences;
+}
+
+static void store_qds_mapping_preferences(const std::string &key, const QdsMappingPreferences &preferences)
+{
+    if (key.empty() || preferences.empty() || !wxGetApp().app_config)
+        return;
+
+    json stored = {{"version", 1}, {"mappings", json::array()}};
+    for (const auto &[project_filament, mapping] : preferences) {
+        stored["mappings"].push_back({
+            {"project_filament", project_filament},
+            {"slot", mapping.first},
+            {"preset_id", mapping.second}
+        });
+    }
+    wxGetApp().app_config->set("ams_filament_ids", key, stored.dump());
+}
+
 std::string get_nozzle_volume_type_cloud_string(NozzleVolumeType nozzle_volume_type)
 {
     if (nozzle_volume_type == NozzleVolumeType::nvtStandard) {
@@ -1454,6 +1506,8 @@ bool SelectMachineDialog::do_ams_mapping(MachineObject *obj_,bool use_ams, bool 
         filament_result = DevMappingUtil::ams_filament_mapping(obj_, m_filaments, m_ams_mapping_result, map_opt, {}, false, from_sdcard_view, m_printer_last_select);
         // auto_supply_with_ext(obj_->vt_slot);
     }
+
+    restore_qds_mapping_preferences();
 
     if (filament_result == 0) {
         print_ams_mapping_result(m_ams_mapping_result);
@@ -4346,6 +4400,97 @@ void SelectMachineDialog::on_refresh(wxCommandEvent &event)
     show_status(PrintDialogStatus::PrintStatusInit);
 }
 
+void SelectMachineDialog::restore_qds_mapping_preferences()
+{
+    auto qds_manager = wxGetApp().qdsdevmanager;
+    if (!qds_manager)
+        return;
+
+    auto device = qds_manager->getDevice(m_printer_last_select);
+    if (!device) {
+        auto selected = qds_manager->getSelectedDevice();
+        const std::string &box_ip = m_plater->sidebar().box_list_printer_ip;
+        if (selected && (box_ip.empty() || selected->m_ip == box_ip))
+            device = selected;
+    }
+    if (!device || device->m_box_snapshot.slots.empty())
+        return;
+
+    const std::string key = qds_mapping_persistence_key();
+    const auto preferences = load_qds_mapping_preferences(key);
+    for (auto &mapping : m_ams_mapping_result) {
+        const auto preference = preferences.find(mapping.id);
+        if (preference == preferences.end())
+            continue;
+
+        const int slot_index = preference->second.first;
+        const std::string &preset_id = preference->second.second;
+        if (!QDSBoxSync::mapping_is_current(device->m_box_snapshot, slot_index, preset_id)) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": ignored stale QDS mapping for project filament "
+                                       << mapping.id << " slot=" << slot_index;
+            continue;
+        }
+
+        const auto slot = std::find_if(device->m_box_snapshot.slots.begin(), device->m_box_snapshot.slots.end(),
+                                       [slot_index](const QDSBoxSync::BoxSlotSnapshot &candidate) {
+                                           return candidate.slot_index == slot_index;
+                                       });
+        if (slot == device->m_box_snapshot.slots.end())
+            continue;
+
+        mapping.tray_id = slot_index;
+        mapping.ams_id = std::to_string(slot_index / QDSBoxSync::slots_per_box + 1);
+        mapping.slot_id = std::to_string(slot_index);
+        mapping.filament_id = preset_id;
+        mapping.distance = 0.0f;
+        mapping.mapping_result = 0;
+        mapping.ctype = 0;
+        mapping.colors.clear();
+        if (slot->material_type)
+            mapping.type = *slot->material_type;
+        if (slot->colour)
+            mapping.color = slot->colour->substr(1) + "FF";
+
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": restored QDS mapping for project filament "
+                                << mapping.id << " slot=" << slot_index << " preset_id=" << preset_id;
+    }
+}
+
+void SelectMachineDialog::persist_qds_mapping_preferences()
+{
+    auto qds_manager = wxGetApp().qdsdevmanager;
+    if (!qds_manager)
+        return;
+
+    auto device = qds_manager->getDevice(m_printer_last_select);
+    if (!device) {
+        auto selected = qds_manager->getSelectedDevice();
+        const std::string &box_ip = m_plater->sidebar().box_list_printer_ip;
+        if (selected && (box_ip.empty() || selected->m_ip == box_ip))
+            device = selected;
+    }
+    if (!device || device->m_box_snapshot.slots.empty())
+        return;
+
+    QdsMappingPreferences preferences;
+    for (const auto &mapping : m_ams_mapping_result) {
+        const int slot_index = mapping.get_slot_id();
+        const auto slot = std::find_if(device->m_box_snapshot.slots.begin(), device->m_box_snapshot.slots.end(),
+                                       [slot_index](const QDSBoxSync::BoxSlotSnapshot &candidate) {
+                                           return candidate.slot_index == slot_index;
+                                       });
+        if (slot == device->m_box_snapshot.slots.end() || !slot->filament_preset_id)
+            continue;
+        preferences[mapping.id] = {slot_index, *slot->filament_preset_id};
+    }
+
+    const std::string key = qds_mapping_persistence_key();
+    store_qds_mapping_preferences(key, preferences);
+    if (!preferences.empty())
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": persisted " << preferences.size()
+                                << " QDS mapping(s) for selected printer profile";
+}
+
 void SelectMachineDialog::on_set_finish_mapping(wxCommandEvent &evt)
 {
     auto selection_data = evt.GetString();
@@ -4447,6 +4592,8 @@ void SelectMachineDialog::on_set_finish_mapping(wxCommandEvent &evt)
                 iter++;
             }
         }
+
+        persist_qds_mapping_preferences();
     }
 
     update_filament_change_count();
@@ -5225,8 +5372,6 @@ static wxString _get_ext_loc_str(const std::unordered_set<int>& extruders, int t
 
 void SelectMachineDialog::update_show_status(MachineObject* obj_)
 {
-    obj_ = new MachineObject("machine_name");
-
     PartPlate* plate = m_plater->get_partplate_list().get_curr_plate();
 
     if (m_print_type == PrintFromType::FROM_NORMAL) {
@@ -5277,7 +5422,8 @@ void SelectMachineDialog::update_show_status(MachineObject* obj_)
     }
 
     /* multi color external change assist*/
-    bool is_support_mutile_color = obj_->is_support_ext_change_assist_old || obj_->is_support_ext_change_assist;
+    const bool is_support_mutile_color = obj_ &&
+        (obj_->is_support_ext_change_assist_old || obj_->is_support_ext_change_assist);
     if (is_support_mutile_color && !m_check_ext_change_assist->IsShown()) {
         m_check_ext_change_assist->Show(true);
         m_label_ext_change_assist->Show(true);
@@ -5973,26 +6119,46 @@ void SelectMachineDialog::on_material_item_clicked(MaterialItem* item,
     auto    mouse_pos = ClientToScreen(e.GetPosition());
     wxPoint rect = item->ClientToScreen(wxPoint(0, 0));
 
-    // update ams data
-//y80
-    // DeviceManager* dev_manager = Slic3r::GUI::wxGetApp().getDeviceManager();
-    // if (!dev_manager) return;
-    // MachineObject* obj_ = dev_manager->get_selected_machine();
-    MachineObject* obj_ = new MachineObject("temp_obj");
-    if (obj_) {
-        if (m_mapping_popup.IsShown()) return;
-        if (preset_fila_infos.size() <= used_filament_idx) return;
-        //if (obj_ && obj_->get_dev_id() == m_printer_last_select) {
-        m_mapping_popup.set_parent_item(item);
-        m_mapping_popup.set_current_filament_id(used_filament_idx);
-        m_mapping_popup.set_tag_texture(preset_fila_infos[used_filament_idx].filament_type);
-        m_mapping_popup.set_send_win(this);//fix bug:fisrt click is not valid
-        m_mapping_popup.set_show_type(get_filament_mapping_show_type(obj_, used_filament_idx));
-        m_mapping_popup.update(obj_, m_ams_mapping_result, nullptr, use_dynamic_nozzle_map(), m_print_type, m_printer_last_select);
-        m_mapping_popup.Popup();
-        //}
+    if (m_mapping_popup.IsShown())
+        return;
+    if (used_filament_idx < 0 || static_cast<size_t>(used_filament_idx) >= preset_fila_infos.size()) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": slicing filament index is out of range";
+        return;
     }
-//y80
+
+    auto qds_manager = wxGetApp().qdsdevmanager;
+    auto qds_device = qds_manager ? qds_manager->getDevice(m_printer_last_select) : nullptr;
+    if (!qds_device && qds_manager) {
+        auto selected = qds_manager->getSelectedDevice();
+        const std::string &box_ip = wxGetApp().plater()->sidebar().box_list_printer_ip;
+        if (selected && (box_ip.empty() || selected->m_ip == box_ip))
+            qds_device = selected;
+    }
+    if (!qds_device) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": selected QDS device is unavailable; mapping popup was not opened";
+        return;
+    }
+
+    // Refresh the device-backed arrays from the preserved snapshot before
+    // handing the device to the Send Print selector.
+    if (qds_manager && !qds_manager->upBoxInfoToBoxMsg(qds_device)) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": selected QDS Box snapshot is incompatible or unavailable";
+        return;
+    }
+    if (qds_device->m_box_snapshot.slots.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": selected QDS Box has no validated occupied slots";
+        return;
+    }
+
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": opening QDS mapping popup with "
+                            << qds_device->m_box_snapshot.slots.size() << " occupied slots";
+    m_mapping_popup.set_parent_item(item);
+    m_mapping_popup.set_current_filament_id(used_filament_idx);
+    m_mapping_popup.set_tag_texture(preset_fila_infos[used_filament_idx].filament_type);
+    m_mapping_popup.set_send_win(this);
+    m_mapping_popup.set_show_type(get_filament_mapping_show_type(nullptr, used_filament_idx));
+    m_mapping_popup.update(nullptr, m_ams_mapping_result, qds_device, use_dynamic_nozzle_map(), m_print_type, "");
+    m_mapping_popup.Popup();
 }
 
 void SelectMachineDialog::reset_and_sync_ams_list()

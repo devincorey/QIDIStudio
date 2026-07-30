@@ -108,9 +108,9 @@ void AmsMapingPopup::update(MachineObject* obj,
         m_split_line_panel->Hide();
         m_right_marea_panel->Show();
         m_right_marea_panel->Enable(true);
-        m_right_extra_slot->Show();
-        m_right_extra_slot->Enable(true);
-        m_right_split_ext_sizer->Show(true);
+        m_right_extra_slot->Show(m_has_external_spool);
+        m_right_extra_slot->Enable(m_has_external_spool);
+        m_right_split_ext_sizer->Show(m_has_external_spool);
         set_sizer_title(m_right_split_ams_sizer, _L("BOX"));
     } else if (extruder_num > 1) {
         if (m_show_type == ShowType::LEFT_AND_RIGHT_DYNAMIC) {
@@ -347,7 +347,7 @@ void AmsMapingPopup::update_mapping_items(MachineObject* obj, const std::vector<
     std::vector<std::string> filament_id;
     std::vector<int> slot_id;
     std::vector<int> slot_state;
-    int box_count;
+    int box_count = 0;
     if(qds_obj != nullptr){
         filament_colors = qds_obj->m_filament_colors;
         filament_type = qds_obj->m_filament_type;
@@ -358,6 +358,10 @@ void AmsMapingPopup::update_mapping_items(MachineObject* obj, const std::vector<
 //y80
     } else if(!dev_id.empty()){
         auto qds_device = GUI::wxGetApp().qdsdevmanager->getDevice(dev_id);
+        if (!qds_device) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": QDS device disappeared before mapping popup update";
+            return;
+        }
         filament_colors = qds_device->m_filament_colors;
         filament_type = qds_device->m_filament_type;
         filament_id = qds_device->m_filament_id;
@@ -375,6 +379,8 @@ void AmsMapingPopup::update_mapping_items(MachineObject* obj, const std::vector<
     }
 
 
+    const size_t aligned_size = std::min({filament_colors.size(), filament_type.size(), filament_id.size(), slot_id.size(), slot_state.size()});
+    box_count = std::clamp(box_count, 0, QDSBoxSync::max_box_count);
     for(int box_num = 0; box_num < box_count; box_num++){
         for (int j = 0; j < 1; j++) {
 
@@ -394,18 +400,24 @@ void AmsMapingPopup::update_mapping_items(MachineObject* obj, const std::vector<
                 td.id = i;
 
                 td.ams_id = box_num + 1;
-                if(slot_state[i])
+                const bool occupied = static_cast<size_t>(i) < aligned_size && slot_state[i] != 0 && slot_id[i] >= 0 && !filament_id[i].empty();
+                if(occupied)
                     td.slot_id = slot_id[i];
                 else
                     td.slot_id = VIRTUAL_TRAY_MAIN_ID;
 
-
-                td.type = NORMAL;
+                td.type = occupied ? NORMAL : EMPTY;
                 td.remain = 0;
-                std::string color = filament_colors[i];
-                td.colour = DevAmsTray::decode_color((color.erase(0, 1)) + "FF");
-                td.name = filament_type[i];
-                td.filament_type = filament_type[i];
+                const std::string colour = occupied ? QDSBoxSync::normalize_colour(filament_colors[i]).value_or("#CECECE") : "#CECECE";
+                td.colour = DevAmsTray::decode_color(colour.substr(1) + "FF");
+                td.name = occupied ? filament_type[i] : "";
+                td.filament_type = occupied ? filament_type[i] : "";
+                if (occupied && qds_obj) {
+                    const auto snapshot_slot = std::find_if(qds_obj->m_box_snapshot.slots.begin(), qds_obj->m_box_snapshot.slots.end(),
+                                                            [i](const QDSBoxSync::BoxSlotSnapshot &slot) { return slot.slot_index == i; });
+                    if (snapshot_slot != qds_obj->m_box_snapshot.slots.end() && snapshot_slot->material_name)
+                        td.name = *snapshot_slot->material_name;
+                }
                 td.ctype = TrayType::NORMAL;
 
                 tray_datas.push_back(td);
@@ -435,8 +447,11 @@ void AmsMapingPopup::update_mapping_items(MachineObject* obj, const std::vector<
         }
     }
 
-    //ext
-    {
+    // External spool is not displayed for an empty firmware placeholder.
+    constexpr size_t external_index = 16;
+    m_has_external_spool = aligned_size > external_index && slot_state[external_index] != 0 &&
+                           slot_id[external_index] >= 0 && !filament_id[external_index].empty();
+    if (m_has_external_spool) {
         TrayData td;
 
         td.id = 0;
@@ -448,13 +463,16 @@ void AmsMapingPopup::update_mapping_items(MachineObject* obj, const std::vector<
 
         td.type = NORMAL;
         td.remain = 0;
-        std::string color = filament_colors.back();
-        td.colour = DevAmsTray::decode_color((color.erase(0, 1)) + "FF");
-        td.name = filament_type.back();
-        td.filament_type = filament_type.back();
+        const std::string colour = QDSBoxSync::normalize_colour(filament_colors[external_index]).value_or("#CECECE");
+        td.colour = DevAmsTray::decode_color(colour.substr(1) + "FF");
+        td.name = filament_type[external_index];
+        td.filament_type = filament_type[external_index];
         td.ctype = TrayType::NORMAL;
         m_right_extra_slot->send_win = send_win;
         add_ext_ams_mapping(td, m_right_extra_slot);
+    } else {
+        m_right_extra_slot->Hide();
+        m_right_split_ext_sizer->Show(false);
     }
 
 
