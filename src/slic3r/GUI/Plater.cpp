@@ -2221,39 +2221,8 @@ bool Sidebar::priv::sync_extruder_list(bool &only_external_material, bool is_man
                     }
 
                     if (resultJson["data"].contains("nozzle.diameter")) {
-                        std::vector<float> nozzle_diameter_temp;
-                        bool nozzle_metadata_valid = true;
-                        auto append_nozzle = [&nozzle_diameter_temp, &nozzle_metadata_valid](const json &value) {
-                            try {
-                                if (value.is_number()) {
-                                    nozzle_diameter_temp.push_back(value.get<float>());
-                                } else if (value.is_string()) {
-                                    const std::string text = value.get<std::string>();
-                                    size_t parsed = 0;
-                                    const float diameter = std::stof(text, &parsed);
-                                    if (parsed != text.size())
-                                        throw std::invalid_argument("nozzle diameter contains trailing characters");
-                                    nozzle_diameter_temp.push_back(diameter);
-                                } else {
-                                    nozzle_metadata_valid = false;
-                                }
-                            } catch (const std::exception &) {
-                                nozzle_metadata_valid = false;
-                            }
-                        };
-                        if (resultJson["data"]["nozzle.diameter"].is_string() ||
-                            resultJson["data"]["nozzle.diameter"].is_number()) {
-                            append_nozzle(resultJson["data"]["nozzle.diameter"]);
-                        }
-                        else if (resultJson["data"]["nozzle.diameter"].is_array()) {
-                            for (const auto& item : resultJson["data"]["nozzle.diameter"]) {
-                                append_nozzle(item);
-                            }
-                        }
-                        if (!nozzle_metadata_valid)
-                            nozzle_diameter_temp.clear();
-                        if (!obj->setReportedNozzleDiameters(std::move(nozzle_diameter_temp)))
-                            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": cloud printer returned empty nozzle metadata";
+                        if (!obj->setReportedNozzleDiametersFromJson(resultJson["data"]["nozzle.diameter"]))
+                            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": cloud printer returned invalid or empty nozzle metadata";
                     }
                 }
             }
@@ -5238,8 +5207,9 @@ void Sidebar::sync_box_list(bool is_from_big_sync_btn)
     
     if (obj && qdsdev) {
         //y80
-        int box_count = obj->m_box_count; 
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "selected device box count is:" << box_count;
+        const auto box_state = obj->getBoxSyncState();
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": selected device box count=" << box_state.snapshot_input.box_count
+                                << " snapshot_ready=" << box_state.ready;
 
         if (!qdsdev->upBoxInfoToBoxMsg(obj)) {
             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": selected QDS printer is incompatible with the active profile";
@@ -5279,13 +5249,14 @@ void Sidebar::sync_box_list(bool is_from_big_sync_btn)
         m_sync_box_dlg->set_info(temp_info);
     }
     m_sync_box_dlg->set_qds_device(obj);
-    const std::string persistence_key = wxGetApp().plater()->box_msg.box_list_preset_name;
+    const std::string persistence_profile = wxGetApp().plater()->box_msg.box_list_preset_name;
+    const std::string persistence_key = QDSBoxSync::mapping_storage_key(persistence_profile);
     QDSBoxSync::MappingPreferences persisted_mappings;
-    if (obj && !persistence_key.empty()) {
+    if (obj && !persistence_profile.empty()) {
         std::vector<std::string> diagnostics;
         persisted_mappings = QDSBoxSync::deserialize_mapping_preferences(
             wxGetApp().app_config->get("ams_filament_ids", persistence_key),
-            QDSBoxSync::MappingContext{persistence_key, QDSBoxSync::mapping_device_identity(obj->m_ip, obj->m_id)},
+            QDSBoxSync::MappingContext{persistence_profile, QDSBoxSync::mapping_device_identity(obj->m_ip, obj->m_id)},
             &diagnostics);
         for (const std::string &diagnostic : diagnostics)
             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": " << diagnostic;
@@ -5348,36 +5319,45 @@ void Sidebar::sync_box_list(bool is_from_big_sync_btn)
         return;
     }
     QDSBoxSync::MappingPreferences stored_mappings;
-    if (obj) {
-        for (const auto &[project_filament, mapping] : sync_result.sync_maps) {
-            try {
-                size_t parsed = 0;
-                const int slot_index = std::stoi(mapping.slot_id, &parsed);
-                if (parsed != mapping.slot_id.size() || slot_index < 0 || slot_index >= QDSBoxSync::max_box_slots)
-                    throw std::invalid_argument("invalid Box slot identifier");
-                const auto slot = std::find_if(obj->m_box_snapshot.slots.begin(), obj->m_box_snapshot.slots.end(),
-                                               [slot_index](const QDSBoxSync::BoxSlotSnapshot &snapshot_slot) {
-                                                   return snapshot_slot.slot_index == slot_index;
-                                               });
-                if (slot != obj->m_box_snapshot.slots.end() && slot->filament_preset_id && project_filament >= 0 &&
-                    static_cast<size_t>(project_filament) < wxGetApp().preset_bundle->filament_presets.size()) {
-                    stored_mappings.emplace(project_filament, QDSBoxSync::MappingPreference{
-                        project_filament,
-                        wxGetApp().preset_bundle->filament_presets[project_filament],
-                        slot_index,
-                        *slot->filament_preset_id
-                    });
+    if (obj && !sync_result.direct_sync) {
+        const auto box_state = obj->getBoxMappingState();
+        if (!box_state.ready) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+                                       << ": skipped mapping persistence because the QDS Box snapshot changed";
+        } else {
+            for (const auto &[project_filament, mapping] : sync_result.sync_maps) {
+                try {
+                    size_t parsed = 0;
+                    const int slot_index = std::stoi(mapping.slot_id, &parsed);
+                    if (parsed != mapping.slot_id.size() || slot_index < 0 || slot_index >= QDSBoxSync::max_box_slots)
+                        throw std::invalid_argument("invalid Box slot identifier");
+                    const auto slot = std::find_if(box_state.snapshot.slots.begin(), box_state.snapshot.slots.end(),
+                                                   [slot_index](const QDSBoxSync::BoxSlotSnapshot &snapshot_slot) {
+                                                       return snapshot_slot.slot_index == slot_index;
+                                                   });
+                    if (slot != box_state.snapshot.slots.end() && slot->filament_preset_id && project_filament >= 0 &&
+                        static_cast<size_t>(project_filament) < wxGetApp().preset_bundle->filament_presets.size()) {
+                        stored_mappings.emplace(project_filament, QDSBoxSync::MappingPreference{
+                            project_filament,
+                            wxGetApp().preset_bundle->filament_presets[project_filament],
+                            slot_index,
+                            *slot->filament_preset_id
+                        });
+                    }
+                } catch (const std::exception &) {
+                    BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": skipped invalid confirmed Box mapping";
                 }
-            } catch (const std::exception &) {
-                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": skipped invalid confirmed Box mapping";
             }
         }
-        if (!persistence_key.empty()) {
+        if (box_state.ready && !persistence_profile.empty()) {
             const auto stored = QDSBoxSync::serialize_mapping_preferences(
-                QDSBoxSync::MappingContext{persistence_key, QDSBoxSync::mapping_device_identity(obj->m_ip, obj->m_id)},
+                QDSBoxSync::MappingContext{persistence_profile, QDSBoxSync::mapping_device_identity(obj->m_ip, obj->m_id)},
                 stored_mappings);
             wxGetApp().app_config->set("ams_filament_ids", persistence_key, stored);
         }
+    } else if (!obj && !persistence_profile.empty()) {
+        wxGetApp().app_config->set("ams_filament_ids", persistence_profile,
+                                   boost::algorithm::join(list2, ","));
     }
     if (!unknowns.empty()) {
         MessageDialog dlg(this,
@@ -22214,7 +22194,9 @@ Preset *get_printer_preset(std::shared_ptr<QDSDevice> obj){
     if (selected_model.empty() || selected_nozzles == nullptr || selected_nozzles->values.empty())
         return nullptr;
 
-    const QDSBoxSync::PrinterMetadata metadata = obj->getPrinterMetadata();
+    const auto manager = wxGetApp().qdsdevmanager;
+    const QDSBoxSync::PrinterMetadata metadata = manager ?
+        manager->getPrinterMetadataForCompatibility(obj) : obj->getPrinterMetadata();
 
     const auto compatibility = QDSBoxSync::resolve_compatibility(metadata, selected_model, selected_nozzles->values.front());
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": compatibility=" << compatibility.compatible

@@ -42,6 +42,13 @@ std::string normalize_model_name(const std::string &model)
         if (std::isalnum(ch))
             normalized.push_back(static_cast<char>(std::tolower(ch)));
     }
+
+    // Discovery services may prepend QIDI's vendor name. Strip only these
+    // explicit prefixes; the remaining model still has to match exactly.
+    if (normalized.rfind("qiditech", 0) == 0)
+        normalized.erase(0, 8);
+    else if (normalized.rfind("qidi", 0) == 0)
+        normalized.erase(0, 4);
     return normalized;
 }
 
@@ -63,6 +70,11 @@ std::string mapping_device_identity(const std::string &host, const std::string &
     return identity.empty() ? normalize(runtime_id) : identity;
 }
 
+std::string mapping_storage_key(const std::string &printer_profile)
+{
+    return printer_profile.empty() ? std::string{} : "qds_box:" + printer_profile;
+}
+
 bool valid_catalog_index(int index, std::size_t catalog_size)
 {
     return index >= 0 && static_cast<std::size_t>(index) < catalog_size;
@@ -71,6 +83,25 @@ bool valid_catalog_index(int index, std::size_t catalog_size)
 bool qidi_filament_ids_compatible(const std::string &project_preset_id, const std::string &slot_preset_id)
 {
     return project_preset_id.rfind("QD_", 0) != 0 || project_preset_id == slot_preset_id;
+}
+
+bool filament_selection_compatible(const std::string &project_material,
+                                   const std::string &project_preset_id,
+                                   const std::string &slot_material,
+                                   const std::string &slot_preset_id,
+                                   bool enforce_material)
+{
+    if (!qidi_filament_ids_compatible(project_preset_id, slot_preset_id))
+        return false;
+    if (!enforce_material)
+        return true;
+
+    const auto lowercase = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return value;
+    };
+    return lowercase(project_material) == lowercase(slot_material);
 }
 
 bool prefer_filament_match(bool candidate_exact, double candidate_colour_distance,
@@ -118,19 +149,31 @@ CompatibilityResult resolve_compatibility(const PrinterMetadata &metadata,
     }
     const bool supported_fallback = selected == "xplus4" && std::fabs(selected_nozzle - 0.4) <= nozzle_tolerance;
 
-    const std::string configured = metadata.configured_model ? normalize_model_name(*metadata.configured_model) : std::string{};
-    const std::string connected = configured;
-    if (!connected.empty() && connected != selected) {
-        result.reason = "connected printer model contradicts the selected profile";
+    const std::string configured = metadata.configured_model ?
+        normalize_model_name(*metadata.configured_model) : std::string{};
+    if (!configured.empty() && configured != selected) {
+        result.reason = "configured physical printer contradicts the selected profile";
         return result;
     }
-    if (connected.empty() && !supported_fallback) {
+
+    bool has_reported_model = false;
+    for (const std::string &reported_model : metadata.reported_models) {
+        const std::string reported = normalize_model_name(reported_model);
+        if (reported.empty())
+            continue;
+        has_reported_model = true;
+        if (reported != selected) {
+            result.reason = "reported printer model contradicts the selected profile";
+            return result;
+        }
+    }
+    if (!has_reported_model && !supported_fallback) {
         result.reason = "missing model metadata fallback is limited to the X-Plus 4 0.4 mm profile";
         return result;
     }
 
     result.effective_model = selected_model;
-    result.used_selected_model_fallback = connected.empty();
+    result.used_selected_model_fallback = !has_reported_model;
 
     if (!metadata.reported_nozzles) {
         if (!supported_fallback) {
@@ -214,6 +257,30 @@ BoxSnapshot normalize_snapshot(const BoxSnapshotInput &input)
     return snapshot;
 }
 
+bool snapshot_ready_for_sync(const BoxSnapshotInput &input,
+                             bool box_count_seen,
+                             const std::array<bool, max_box_slots> &occupancy_seen)
+{
+    if (!box_count_seen || input.box_count < 0 || input.box_count > max_box_count)
+        return false;
+
+    const int usable_slots = input.box_count * slots_per_box;
+    for (int slot_index = 0; slot_index < usable_slots; ++slot_index) {
+        if (!occupancy_seen[slot_index])
+            return false;
+
+        const auto slot = std::find_if(input.slots.begin(), input.slots.end(),
+                                       [slot_index](const RawSlot &candidate) {
+                                           return candidate.slot_index == slot_index;
+                                       });
+        if (slot == input.slots.end())
+            return false;
+        if (slot->occupied && (slot->vendor_index < 0 || slot->filament_index <= 0))
+            return false;
+    }
+    return true;
+}
+
 BoxSnapshotInput merge_snapshot_patch(BoxSnapshotInput input, const BoxSnapshotPatch &patch)
 {
     if (patch.box_count)
@@ -236,19 +303,35 @@ BoxSnapshotInput merge_snapshot_patch(BoxSnapshotInput input, const BoxSnapshotP
             slot = input.slots.end() - 1;
         }
 
-        if (slot_patch.occupied)
+        if (slot_patch.occupied) {
+            slot->occupancy_known = true;
             slot->occupied = *slot_patch.occupied;
-        if (slot_patch.vendor_index)
+            if (!slot->occupied) {
+                slot->vendor_index = -1;
+                slot->filament_index = -1;
+                slot->material_name.clear();
+                slot->material_type.clear();
+                slot->colour.reset();
+                slot->remaining_percent.reset();
+            }
+        }
+
+        // Once a slot is known empty, do not let delayed save_variables
+        // metadata revive the previous spool. Before the first occupancy event,
+        // identity is retained so Moonraker's independent object updates may
+        // arrive in either order.
+        const bool identity_update_allowed = !slot->occupancy_known || slot->occupied;
+        if (slot_patch.vendor_index && (*slot_patch.vendor_index < 0 || identity_update_allowed))
             slot->vendor_index = *slot_patch.vendor_index;
-        if (slot_patch.filament_index)
+        if (slot_patch.filament_index && (*slot_patch.filament_index <= 0 || identity_update_allowed))
             slot->filament_index = *slot_patch.filament_index;
-        if (slot_patch.material_name)
+        if (slot_patch.material_name && (slot_patch.material_name->empty() || identity_update_allowed))
             slot->material_name = *slot_patch.material_name;
-        if (slot_patch.material_type)
+        if (slot_patch.material_type && (slot_patch.material_type->empty() || identity_update_allowed))
             slot->material_type = *slot_patch.material_type;
-        if (slot_patch.colour_present)
+        if (slot_patch.colour_present && (!slot_patch.colour || identity_update_allowed))
             slot->colour = slot_patch.colour;
-        if (slot_patch.remaining_present)
+        if (slot_patch.remaining_present && (!slot_patch.remaining_percent || identity_update_allowed))
             slot->remaining_percent = slot_patch.remaining_percent;
     }
 
@@ -263,6 +346,14 @@ bool mapping_is_current(const BoxSnapshot &snapshot, int slot_index, const std::
     const auto iter = std::find_if(snapshot.slots.begin(), snapshot.slots.end(),
                                    [slot_index](const BoxSlotSnapshot &slot) { return slot.slot_index == slot_index; });
     return iter != snapshot.slots.end() && iter->filament_preset_id && *iter->filament_preset_id == filament_preset_id;
+}
+
+bool mapping_preference_is_current(const BoxSnapshot &snapshot,
+                                   const MappingPreference &preference,
+                                   const std::string &project_preset_id)
+{
+    return mapping_is_current(snapshot, preference.slot_index, preference.slot_preset_id) &&
+           qidi_filament_ids_compatible(project_preset_id, preference.slot_preset_id);
 }
 
 std::string serialize_mapping_preferences(const MappingContext &context, const MappingPreferences &preferences)

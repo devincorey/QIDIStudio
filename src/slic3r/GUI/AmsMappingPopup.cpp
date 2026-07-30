@@ -1114,19 +1114,22 @@ void AmsMapingPopup::update_materials_list(std::vector<std::string> list)
 void AmsMapingPopup::set_tag_texture(std::string texture)
 {
     m_tag_material = texture;
+    m_tag_filament_id.clear();
 }
 
 
 bool AmsMapingPopup::is_match_material(std::string material) const
 {
-    //y75
-    auto toLower = [](std::string s) -> std::string{
-        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
-        return s;
-    };
-    std::string m_tag_material_to_lowser = toLower(m_tag_material);
-    std::string material_to_lower = toLower(material);
-    return m_tag_material_to_lowser == material_to_lower ? true : false;
+    return QDSBoxSync::filament_selection_compatible(m_tag_material, {}, material, {}, true);
+}
+
+bool AmsMapingPopup::is_match_filament(const TrayData &tray_data, bool enforce_material) const
+{
+    return QDSBoxSync::filament_selection_compatible(m_tag_material,
+                                                     m_tag_filament_id,
+                                                     tray_data.filament_type,
+                                                     tray_data.filament_preset_id,
+                                                     enforce_material);
 }
 
 
@@ -1149,11 +1152,10 @@ void AmsMapingPopup::on_left_down(wxMouseEvent &evt)
 
         if (pos.x > p_rect.x && pos.y > p_rect.y && pos.x < (p_rect.x + item->GetSize().x) && pos.y < (p_rect.y + item->GetSize().y)) {
             if (item->m_tray_data.type == TrayType::NORMAL) {
-                if (!m_ext_mapping_filatype_check && (item->m_ams_id == VIRTUAL_TRAY_MAIN_ID || item->m_ams_id == VIRTUAL_TRAY_DEPUTY_ID)) {
-                    // Do nothing
-                } else {
-                    if(!is_match_material(item->m_tray_data.filament_type)) { return; }
-                }
+                const bool is_external = item->m_ams_id == VIRTUAL_TRAY_MAIN_ID ||
+                                         item->m_ams_id == VIRTUAL_TRAY_DEPUTY_ID;
+                if (!is_match_filament(item->m_tray_data, !is_external || m_ext_mapping_filatype_check))
+                    return;
             }
 
             if (item->m_tray_data.type == TrayType::EMPTY) return;

@@ -128,7 +128,8 @@ static QDSBoxSync::MappingPreferences load_qds_mapping_preferences(const std::st
     if (key.empty() || !wxGetApp().app_config)
         return {};
 
-    const std::string stored_json = wxGetApp().app_config->get("ams_filament_ids", key);
+    const std::string storage_key = QDSBoxSync::mapping_storage_key(key);
+    const std::string stored_json = wxGetApp().app_config->get("ams_filament_ids", storage_key);
     std::vector<std::string> diagnostics;
     auto preferences = QDSBoxSync::deserialize_mapping_preferences(
         stored_json, QDSBoxSync::MappingContext{key, device_id}, &diagnostics);
@@ -4381,7 +4382,10 @@ std::shared_ptr<QDSDevice> SelectMachineDialog::get_current_qds_device() const
 void SelectMachineDialog::restore_qds_mapping_preferences()
 {
     auto device = get_current_qds_device();
-    if (!device || device->m_box_snapshot.slots.empty())
+    if (!device)
+        return;
+    const auto box_state = device->getBoxMappingState();
+    if (!box_state.ready || box_state.snapshot.slots.empty())
         return;
 
     const std::string key = qds_mapping_persistence_key();
@@ -4401,19 +4405,21 @@ void SelectMachineDialog::restore_qds_mapping_preferences()
             continue;
         }
 
+        const Preset *project_preset = wxGetApp().preset_bundle->filaments.find_preset(saved.project_preset);
         const int slot_index = saved.slot_index;
         const std::string &preset_id = saved.slot_preset_id;
-        if (!QDSBoxSync::mapping_is_current(device->m_box_snapshot, slot_index, preset_id)) {
+        if (!project_preset ||
+            !QDSBoxSync::mapping_preference_is_current(box_state.snapshot, saved, project_preset->filament_id)) {
             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": ignored stale QDS mapping for project filament "
                                        << mapping.id << " slot=" << slot_index;
             continue;
         }
 
-        const auto slot = std::find_if(device->m_box_snapshot.slots.begin(), device->m_box_snapshot.slots.end(),
+        const auto slot = std::find_if(box_state.snapshot.slots.begin(), box_state.snapshot.slots.end(),
                                        [slot_index](const QDSBoxSync::BoxSlotSnapshot &candidate) {
                                            return candidate.slot_index == slot_index;
                                        });
-        if (slot == device->m_box_snapshot.slots.end())
+        if (slot == box_state.snapshot.slots.end())
             continue;
 
         mapping.tray_id = slot_index;
@@ -5027,9 +5033,10 @@ void SelectMachineDialog::on_selection_changed(wxCommandEvent &event)
                 has_box_machine = false;
                 return;
             }
+            const auto box_state = qds_device->getBoxSyncState();
             bool is_can_change_color = m_plater->is_can_change_color();
             if (extruders_size > 1 && !is_can_change_color) {
-                if (qds_device->m_box_count == 0) {
+                if (!box_state.ready || box_state.snapshot_input.box_count == 0) {
                     show_status(PrintDialogStatus::PrinterNotConnectBox);
                     has_box_machine = false;
                 }
@@ -5041,7 +5048,7 @@ void SelectMachineDialog::on_selection_changed(wxCommandEvent &event)
                 }
             }
             else {
-                if (qds_device->m_box_count <= 0)
+                if (!box_state.ready || box_state.snapshot_input.box_count <= 0)
                     has_box_machine = false;
                 else
                     has_box_machine = true;
@@ -5067,8 +5074,11 @@ void SelectMachineDialog::on_selection_changed(wxCommandEvent &event)
     } else {
         auto qds_dev = GUI::wxGetApp().qdsdevmanager;
         auto qds_obj = qds_dev->getSelectedDevice();
+        if (!qds_obj)
+            return;
         m_printer_last_select = qds_obj->m_id;
-        has_box_machine = qds_obj->m_box_count != 0 ? true : false;
+        const auto box_state = qds_obj->getBoxSyncState();
+        has_box_machine = box_state.ready && box_state.snapshot_input.box_count > 0;
     }
 
     m_is_printer_change = true;
@@ -6073,12 +6083,13 @@ void SelectMachineDialog::on_material_item_clicked(MaterialItem* item,
             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": selected QDS Box snapshot is incompatible or unavailable";
             return;
         }
-        if (qds_device->m_box_snapshot.slots.empty()) {
+        const auto box_state = qds_device->getBoxMappingState();
+        if (!box_state.ready || box_state.snapshot.slots.empty()) {
             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": selected QDS Box has no validated occupied slots";
             return;
         }
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": opening QDS mapping popup with "
-                                << qds_device->m_box_snapshot.slots.size() << " occupied slots";
+                                << box_state.snapshot.slots.size() << " occupied slots";
     } else {
         machine = get_current_machine();
         if (!machine) {
@@ -6090,6 +6101,8 @@ void SelectMachineDialog::on_material_item_clicked(MaterialItem* item,
     m_mapping_popup.set_parent_item(item);
     m_mapping_popup.set_current_filament_id(used_filament_idx);
     m_mapping_popup.set_tag_texture(preset_fila_infos[used_filament_idx].filament_type);
+    if (qds_device)
+        m_mapping_popup.set_tag_filament_id(preset_fila_infos[used_filament_idx].filament_id);
     m_mapping_popup.set_send_win(this);
     m_mapping_popup.set_show_type(get_filament_mapping_show_type(machine, used_filament_idx));
     m_mapping_popup.update(machine, m_ams_mapping_result, qds_device, use_dynamic_nozzle_map(), m_print_type,
@@ -6957,6 +6970,7 @@ void SelectMachineDialog::set_default_from_sdcard()
                     m_mapping_popup.set_parent_item(item);
                     m_mapping_popup.set_current_filament_id(fo.id);
                     m_mapping_popup.set_tag_texture(fo.type);
+                    m_mapping_popup.set_tag_filament_id(fo.filament_id);
                     m_mapping_popup.set_send_win(this);
                     m_mapping_popup.update(nullptr, m_ams_mapping_result, obj, false, std::nullopt, "");
                     m_mapping_popup.Popup();
