@@ -57,6 +57,8 @@ namespace Slic3r{
 
 namespace Slic3r { namespace GUI {
 
+class QDSDevice;
+
 std::string get_nozzle_volume_type_cloud_string(NozzleVolumeType nozzle_volume_type);
 void        print_ams_mapping_result(std::vector<FilamentInfo> &result);
 
@@ -570,7 +572,7 @@ public:
     void on_refresh(wxCommandEvent& event);
     void on_set_finish_mapping(wxCommandEvent& evt);
     void restore_qds_mapping_preferences();
-    void persist_qds_mapping_preferences();
+    std::shared_ptr<QDSDevice> get_current_qds_device() const;
     void on_print_job_cancel(wxCommandEvent& evt);
     void set_default();
     void change_materialitem_tip(bool no_ams_only_ext);

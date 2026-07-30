@@ -37,6 +37,7 @@
 #include "Widgets/PopupWindow.hpp"
 #include <wx/simplebook.h>
 #include <wx/hashmap.h>
+#include <unordered_set>
 
 #include "slic3r/GUI/DeviceCore/DevUtil.h"
 
@@ -291,6 +292,7 @@ public:
 
     bool        m_has_unmatch_filament {false};
     bool        m_has_external_spool{false};
+    std::unordered_set<MappingItem *> m_bound_external_items;
     int         m_current_filament_id;
     ShowType    m_show_type{ShowType::RIGHT};
     std::string m_tag_material;

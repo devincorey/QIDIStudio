@@ -10,6 +10,7 @@
 #include "SelectMachine.hpp"
 #include "DeviceManager.hpp"
 #include "BaseTransparentDPIFrame.hpp"
+#include "DeviceCore/QDSBoxSync.hpp"
 #include "DeviceCore/QDSModalClose.hpp"
 class Button;
 class CheckBox;
@@ -62,7 +63,7 @@ class SyncBoxInfoDialog : public DPIDialog
     std::vector<POItem> ops_no_auto;
     MachineObject* obj_{nullptr};
     std::weak_ptr<QDSDevice> m_qds_device;
-    std::map<int, std::pair<int, std::string>> m_persisted_mappings;
+    QDSBoxSync::MappingPreferences m_persisted_mappings;
     QDSModalCloseCoordinator m_modal_close;
 
 protected:
@@ -247,7 +248,7 @@ public:
     ~SyncBoxInfoDialog();
     void set_info(SyncInfo &info);
     void set_qds_device(const std::shared_ptr<QDSDevice> &device) { m_qds_device = device; }
-    void set_persisted_mappings(const std::map<int, std::pair<int, std::string>> &mappings) { m_persisted_mappings = mappings; }
+    void set_persisted_mappings(const QDSBoxSync::MappingPreferences &mappings) { m_persisted_mappings = mappings; }
     void on_dpi_changed(const wxRect &suggested_rect) override;
     const SyncResult &get_result() { return m_result; }
 

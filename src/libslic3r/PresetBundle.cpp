@@ -2540,7 +2540,6 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
     std::vector<std::string> ams_filament_colors;
     std::vector<std::string> ams_filament_color_types;
     std::vector<AMSMapInfo>  ams_array_maps;
-    ams_multi_color_filment.clear();
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": filament_ams_list size: %1%") % filament_ams_list.size();
     struct AmsInfo
     {
@@ -2555,6 +2554,54 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
     std::vector<AmsInfo> ams_infos;
     int                  index = 0;
     std::set<std::pair<std::string, std::string>> added_filaments;
+
+    // QIDI Box IDs encode the exact catalog preset. Reject the operation before
+    // mutating maps or building parallel slot arrays if any exact preset is
+    // unavailable; compacting only one of those arrays can shift later slots.
+    const auto parse_slot_index = [](const std::string &value) -> std::optional<int> {
+        if (value.empty())
+            return std::nullopt;
+        try {
+            size_t parsed = 0;
+            const int slot_index = std::stoi(value, &parsed);
+            if (parsed != value.size() || slot_index < 0)
+                return std::nullopt;
+            return slot_index;
+        } catch (const std::exception &) {
+            return std::nullopt;
+        }
+    };
+
+    bool invalid_qidi_data = false;
+    for (auto &entry : filament_ams_list) {
+        auto &ams = entry.second;
+        if (skip_ext && ams.opt_string("tray_name", 0u) == "Ext")
+            continue;
+        const std::string slot_id = ams.opt_string("slot_id", 0u);
+        if (!parse_slot_index(slot_id)) {
+            unknowns.emplace_back(&ams, L("The printer returned an invalid Box slot identifier; synchronization was not performed."));
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": invalid Box slot identifier";
+            invalid_qidi_data = true;
+            continue;
+        }
+        const std::string filament_id = ams.opt_string("filament_id", 0u);
+        if (!boost::algorithm::starts_with(filament_id, "QD_"))
+            continue;
+
+        const auto exact = std::find_if(filaments.begin(), filaments.end(), [this, &filament_id](auto &filament) {
+            return filament.is_compatible && filaments.get_preset_base(filament) == &filament &&
+                   filament.filament_id == filament_id;
+        });
+        if (exact == filaments.end()) {
+            unknowns.emplace_back(&ams, L("The exact QIDI filament preset is unavailable or incompatible; no substitute preset was selected."));
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": exact QIDI filament preset is unavailable: " << filament_id;
+            invalid_qidi_data = true;
+        }
+    }
+    if (invalid_qidi_data)
+        return 0;
+    ams_multi_color_filment.clear();
+
     for (auto &entry : filament_ams_list) {
         auto & ams = entry.second;
         auto filament_id = ams.opt_string("filament_id", 0u);
@@ -2572,11 +2619,18 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
         auto filament_color = ams.opt_string("filament_colour", 0u);
         auto filament_color_type = ams.opt_string("filament_colour_type", 0u);
         auto filament_changed = !ams.has("filament_changed") || ams.opt_bool("filament_changed");
-        auto filament_multi_color = ams.opt<ConfigOptionStrings>("filament_multi_colour")->values;
+        std::vector<std::string> filament_multi_color;
+        if (const auto *multi_colour = ams.opt<ConfigOptionStrings>("filament_multi_colour"))
+            filament_multi_color = multi_colour->values;
         //y59
-        auto ams_id     = std::to_string(std::stoi(ams.opt_string("slot_id", 0u)) / 4 + 1);
-        
         auto slot_id    = ams.opt_string("slot_id", 0u);
+        const auto slot_index = parse_slot_index(slot_id);
+        if (!slot_index) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": Box slot identifier became invalid after preflight";
+            return 0;
+        }
+        auto ams_id     = std::to_string(*slot_index / 4 + 1);
+
         ams_infos.push_back({filament_id.empty() ? false : true,false, filament_color});
         AMSMapInfo temp = {ams_id, slot_id};
         ams_array_maps.push_back(temp);
@@ -2617,7 +2671,7 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
             if (boost::algorithm::starts_with(requested_filament_id, "QD_")) {
                 BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": refusing Generic/previous/random fallback for exact QIDI filament id " << requested_filament_id;
                 unknowns.emplace_back(&ams, L("The exact QIDI filament preset is unavailable or incompatible; no substitute preset was selected."));
-                continue;
+                return 0;
             }
             if (!filament_type.empty()) {
                 filament_type = "Generic " + filament_type;

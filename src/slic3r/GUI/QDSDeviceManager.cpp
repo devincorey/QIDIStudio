@@ -653,9 +653,15 @@ void QDSDevice::updateByJsonData(const json& status)
 			}
 	}
     const bool has_save_variables = status.contains("save_variables") && status["save_variables"].is_object();
-    const bool has_box_stepper = std::any_of(status.begin(), status.end(), [](const json &entry) {
-        return entry.is_object() && entry.contains("runout_button");
-    });
+    bool has_box_stepper = false;
+    if (status.is_object()) {
+        for (auto entry = status.begin(); entry != status.end(); ++entry) {
+            if (entry.key().rfind("box_stepper ", 0) == 0 && entry.value().is_object() && entry.value().contains("runout_button")) {
+                has_box_stepper = true;
+                break;
+            }
+        }
+    }
     if (has_save_variables || has_box_stepper) {
         updateBoxDataByJson(status);
     }
@@ -721,8 +727,9 @@ void QDSDevice::updateByJsonData(const json& status)
 	}
 }
 
-void QDSDevice::updateBoxDataByJson(const json status)
+void QDSDevice::updateBoxDataByJson(const json &status)
 {
+	std::lock_guard<std::mutex> config_lock(m_config_mtx);
 	const json empty_save_variables = json::object();
 	const json &save_variables = status.contains("save_variables") && status["save_variables"].is_object()
 		? status["save_variables"] : empty_save_variables;
@@ -823,7 +830,12 @@ void QDSDevice::updateBoxDataByJson(const json status)
 		snapshot_patch.loaded_slot.reset();
 		if (m_cur_slot.rfind("slot", 0) == 0) {
 			try {
-				snapshot_patch.loaded_slot = std::stoi(m_cur_slot.substr(4));
+				const std::string slot_suffix = m_cur_slot.substr(4);
+				size_t parsed = 0;
+				const int loaded_slot = std::stoi(slot_suffix, &parsed);
+				if (parsed != slot_suffix.size())
+					throw std::invalid_argument("loaded slot contains trailing characters");
+				snapshot_patch.loaded_slot = loaded_slot;
 			} catch (const std::exception &) {
 				BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": invalid loaded-slot value";
 			}
@@ -842,7 +854,7 @@ void QDSDevice::updateBoxDataByJson(const json status)
     if (auto_reload != -1)
         m_auto_reload_detect = bool(auto_reload);
 
-	m_box_snapshot_input = QDSBoxSync::merge_snapshot_patch(std::move(m_box_snapshot_input), snapshot_patch);
+    m_box_snapshot_input = QDSBoxSync::merge_snapshot_patch(std::move(m_box_snapshot_input), snapshot_patch);
 	if (external_touched && m_boxData[16].hasMaterial) {
 		QDSBoxSync::RawSlot external;
 		external.slot_index     = 16;
@@ -866,112 +878,78 @@ void QDSDevice::updateBoxDataByJson(const json status)
 
 void QDSDevice::updateFilamentConfig()
 {
-    if (!m_is_init_filamentConfig) {
-       
+    std::vector<Filament> updated_catalog;
+    std::string catalog_base_url;
+    {
         std::lock_guard<std::mutex> lock(m_config_mtx);
-        if (m_is_init_filamentConfig) {
+        if (m_is_init_filamentConfig)
+            return;
+        updated_catalog = m_filamentConfig;
+        catalog_base_url = m_frp_url;
+    }
+
+    std::string result_body;
+    Slic3r::Http::get(catalog_base_url + "/api/qidiclient/config/offical_filament_list")
+        .timeout_max(5)
+        .header("accept", "application/json")
+        .header("Content-Type", "application/json")
+        .on_complete([&result_body](std::string body, unsigned) { result_body = std::move(body); })
+        .on_error([](std::string, std::string error, unsigned status) {
+            BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog request failed: HTTP " << status << ", " << error;
+        })
+        .perform_sync();
+
+    try {
+        const json response = json::parse(result_body);
+        if (!response.is_object() || !response.contains("result") || !response["result"].is_object()) {
+            BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog response omitted a valid result object";
             return;
         }
-    }
-    
-    auto future1 = std::async(std::launch::async, [this]() {
+        const json &result = response["result"];
+        auto apply_catalog_field = [&result, &updated_catalog](const char *name, auto apply_value) {
+            if (!result.contains(name) || !result[name].is_object()) {
+                BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog omitted field " << name;
+                return false;
+            }
+            try {
+                for (const auto &element : result[name].items()) {
+                    size_t parsed = 0;
+                    const long index = std::stol(element.key(), &parsed);
+                    if (parsed != element.key().size() || index < 0 ||
+                        static_cast<size_t>(index) >= updated_catalog.size()) {
+                        BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog ignored out-of-range " << name
+                                                   << " index " << element.key();
+                        return false;
+                    }
+                    apply_value(updated_catalog[static_cast<size_t>(index)], element.value());
+                }
+            } catch (const std::exception &e) {
+                BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog rejected field " << name << ": " << e.what();
+                return false;
+            }
+            return true;
+        };
+
+        bool valid = true;
+        valid &= apply_catalog_field("filament", [](Filament &item, const json &value) { item.name = value.get<std::string>(); });
+        valid &= apply_catalog_field("type", [](Filament &item, const json &value) { item.type = value.get<std::string>(); });
+        valid &= apply_catalog_field("colordict", [](Filament &item, const json &value) { item.colorHexCode = value.get<std::string>(); });
+        valid &= apply_catalog_field("vendor_list", [](Filament &item, const json &value) { item.vendor = value.get<std::string>(); });
+        valid &= apply_catalog_field("min_temp", [](Filament &item, const json &value) { item.minTemp = value.get<int>(); });
+        valid &= apply_catalog_field("max_temp", [](Filament &item, const json &value) { item.maxTemp = value.get<int>(); });
+        valid &= apply_catalog_field("box_min_temp", [](Filament &item, const json &value) { item.boxMinTemp = value.get<int>(); });
+        valid &= apply_catalog_field("box_max_temp", [](Filament &item, const json &value) { item.boxMaxTemp = value.get<int>(); });
+        if (!valid)
+            return;
+
         std::lock_guard<std::mutex> lock(m_config_mtx);
-        std::string url = m_frp_url + "/api/qidiclient/config/offical_filament_list";
-        Slic3r::Http httpPost = Slic3r::Http::get(url);
-        std::string resultBody;
-        httpPost.timeout_max(5)
-            .header("accept", "application/json")
-            .header("Content-Type", "application/json")
-            .on_complete(
-                [&resultBody](std::string body, unsigned status) {
-                    resultBody = body;
-                }
-            )
-            .on_error(
-                [](std::string, std::string error, unsigned status) {
-                    BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog request failed: HTTP " << status << ", " << error;
-                }
-                ).perform_sync();
-        try {
-            json bodyJson = json::parse(resultBody);
-            if (!bodyJson.is_object()) {
-                BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog response was not an object";
-                return;
-            }
-            if (!bodyJson.contains("result")) {
-                BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog response omitted result";
-                return;
-            }
-            json resultJson = bodyJson["result"];
-            if (!resultJson.is_object()) {
-                BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog result was not an object";
-                return;
-            }
-            auto parseToString = [&resultJson](std::string name, std::vector<std::string>& data) {
-                if (!resultJson.contains(name) || !resultJson[name].is_object()) {
-                    return;
-                }
-                data.resize(100);
-                for (auto& element : resultJson[name].items()) {
-                    std::string key = element.key();
-                    int index = std::stoi(key);
-                    data[index] = element.value().get<std::string>();
-                }
-            };
-            auto parseToInt = [&resultJson](std::string name, std::vector<int>& data) {
-                if (!resultJson.contains(name) || !resultJson[name].is_object()) {
-                    return;
-                }
-                data.resize(100);
-                for (auto& element : resultJson[name].items()) {
-                    std::string key = element.key();
-                    int index = std::stoi(key);
-                    data[index] = element.value().get<int>();
-                }
-            };
-
-            std::vector<std::string> names;
-			std::vector<std::string> types;
-			std::vector<std::string> colorHexCodes;
-			std::vector<std::string> vendors;
-            parseToString("filament", names);
-			parseToString("type", types);
-			parseToString("colordict", colorHexCodes);
-			parseToString("vendor_list", vendors);
-			std::vector<int> minTemps;
-			std::vector<int> maxTemps;
-			std::vector<int> boxMinTemps;
-			std::vector<int> boxMaxTemps;
-			parseToInt("min_temp", minTemps);
-			parseToInt("max_temp", maxTemps);
-			parseToInt("box_min_temp", boxMinTemps);
-			parseToInt("box_max_temp", boxMaxTemps);
-
-            if(minTemps.size() != m_filamentConfig.size() || maxTemps.size() != m_filamentConfig.size() || boxMinTemps.size() != m_filamentConfig.size() || boxMaxTemps.size() != m_filamentConfig.size())
-                return;
-            for (int i = 1; i < m_filamentConfig.size(); ++i) {
-				m_filamentConfig[i].name = names[i];
-				m_filamentConfig[i].type = types[i];
-				m_filamentConfig[i].minTemp = minTemps[i];
-				m_filamentConfig[i].maxTemp = maxTemps[i];
-				m_filamentConfig[i].boxMinTemp = boxMinTemps[i];
-				m_filamentConfig[i].boxMaxTemp = boxMaxTemps[i];
-
-				m_filamentConfig[i].vendor = vendors[i];
-				m_filamentConfig[i].colorHexCode = colorHexCodes[i];
-            }
+        if (!m_is_init_filamentConfig) {
+            m_filamentConfig = std::move(updated_catalog);
             m_is_init_filamentConfig = true;
-
         }
-        catch (const std::exception &e) {
-            BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog parsing failed: " << e.what();
-        }
-
-        
-	});
-
-
-    
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog parsing failed: " << e.what();
+    }
 }
 
 bool QDSDevice::is_online(){
@@ -1093,7 +1071,36 @@ void QDSDevice::initGeneralData()
 }
 
 std::vector<float> QDSDevice::getNozzleDiameter(){
+    std::lock_guard<std::mutex> lock(m_config_mtx);
     return m_nozzle_diameter;
+}
+
+bool QDSDevice::setReportedNozzleDiameters(std::vector<float> diameters)
+{
+    const bool has_reported_nozzles = !diameters.empty() &&
+        std::all_of(diameters.begin(), diameters.end(),
+                    [](float diameter) { return std::isfinite(diameter) && diameter > 0.0f; });
+    if (!has_reported_nozzles)
+        diameters.clear();
+    std::lock_guard<std::mutex> lock(m_config_mtx);
+    m_has_reported_nozzle_diameter = true;
+    m_reported_nozzle_metadata_valid = has_reported_nozzles;
+    m_nozzle_diameter = has_reported_nozzles ? std::move(diameters) : std::vector<float>{0.4f};
+    return has_reported_nozzles;
+}
+
+QDSBoxSync::PrinterMetadata QDSDevice::getPrinterMetadata()
+{
+    std::lock_guard<std::mutex> lock(m_config_mtx);
+    QDSBoxSync::PrinterMetadata metadata;
+    if (!m_type.empty())
+        metadata.configured_model = m_type;
+    if (m_has_reported_nozzle_diameter) {
+        metadata.reported_nozzles.emplace();
+        if (m_reported_nozzle_metadata_valid)
+            metadata.reported_nozzles->assign(m_nozzle_diameter.begin(), m_nozzle_diameter.end());
+    }
+    return metadata;
 }
 
 //y79
@@ -2082,8 +2089,15 @@ void QDSDeviceManager::updateDeviceMsg(const std::string& device_id, const json&
                             auto append_nozzle = [&reported_nozzles](const json &item) {
                                 if (item.is_number())
                                     reported_nozzles.push_back(item.get<float>());
-                                else if (item.is_string())
-                                    reported_nozzles.push_back(std::stof(item.get<std::string>()));
+                                else if (item.is_string()) {
+                                    const std::string value = item.get<std::string>();
+                                    size_t parsed = 0;
+                                    const float nozzle = std::stof(value, &parsed);
+                                    if (parsed != value.size())
+                                        throw std::invalid_argument("nozzle diameter contains trailing characters");
+                                    reported_nozzles.push_back(nozzle);
+                                } else
+                                    throw std::invalid_argument("unsupported nozzle diameter value");
                             };
                             if (nozzle_value.is_array()) {
                                 for (const auto &item : nozzle_value)
@@ -2095,12 +2109,8 @@ void QDSDeviceManager::updateDeviceMsg(const std::string& device_id, const json&
                             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": invalid reported nozzle metadata: " << e.what();
                             reported_nozzles.clear();
                         }
-                        if (!reported_nozzles.empty()) {
-                            device->m_nozzle_diameter = std::move(reported_nozzles);
-                            device->m_has_reported_nozzle_diameter = true;
-                        } else {
+                        if (!device->setReportedNozzleDiameters(std::move(reported_nozzles)))
                             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": reported nozzle metadata was empty";
-                        }
                     }
                 }
 
@@ -2477,10 +2487,14 @@ bool QDSDeviceManager::upBoxInfoToBoxMsg(std::shared_ptr<QDSDevice>& device){
     }
 
     QDSBoxSync::PrinterMetadata metadata;
-    if (!device->m_type.empty())
-        metadata.configured_model = device->m_type;
-    if (device->hasReportedNozzleDiameter())
-        metadata.reported_nozzles.assign(device->m_nozzle_diameter.begin(), device->m_nozzle_diameter.end());
+    QDSBoxSync::BoxSnapshotInput snapshot_input;
+    int auto_reload_detect = 0;
+    {
+        std::lock_guard<std::mutex> lock(manager_mutex_);
+        metadata = device->getPrinterMetadata();
+        snapshot_input = device->m_box_snapshot_input;
+        auto_reload_detect = device->m_auto_reload_detect;
+    }
 
     const auto compatibility = QDSBoxSync::resolve_compatibility(metadata, selected_model, nozzle_opt->values.front());
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": compatibility=" << compatibility.compatible
@@ -2491,13 +2505,6 @@ bool QDSDeviceManager::upBoxInfoToBoxMsg(std::shared_ptr<QDSDevice>& device){
     if (!compatibility.compatible)
         return false;
 
-    QDSBoxSync::BoxSnapshotInput snapshot_input;
-    int auto_reload_detect = 0;
-    {
-        std::lock_guard<std::mutex> lock(manager_mutex_);
-        snapshot_input = device->m_box_snapshot_input;
-        auto_reload_detect = device->m_auto_reload_detect;
-    }
     snapshot_input.box_id = box_id;
     auto snapshot = QDSBoxSync::normalize_snapshot(snapshot_input);
     for (const auto &diagnostic : snapshot.diagnostics)
@@ -2545,7 +2552,7 @@ bool QDSDeviceManager::upBoxInfoToBoxMsg(std::shared_ptr<QDSDevice>& device){
     wxGetApp().plater()->box_msg.filament_type = filament_type;
     wxGetApp().plater()->box_msg.slot_id = slot_id;
     wxGetApp().plater()->box_msg.auto_reload_detect = auto_reload_detect;
-    wxGetApp().plater()->box_msg.box_list_preset_name = selected_model;
+    wxGetApp().plater()->box_msg.box_list_preset_name = selected_preset.name;
     //y78
     if(snapshot.box_count > 0)
         wxGetApp().plater()->sidebar().box_list_printer_ip = device->m_ip;

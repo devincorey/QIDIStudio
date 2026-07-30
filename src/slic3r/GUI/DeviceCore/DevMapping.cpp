@@ -75,6 +75,7 @@ namespace Slic3r
         float distance;
         bool  is_same_color = true;
         bool  is_type_match = true;
+        bool  is_exact_identity = false;
     };
 
     static void _parse_tray_info(int ams_id, int slot_id, DevAmsType type, DevAmsTray tray, FilamentInfo& result)
@@ -143,7 +144,8 @@ namespace Slic3r
         }
         //y80
         else if (dev_id != "") {
-            auto qds_device = GUI::wxGetApp().qdsdevmanager->getDevice(dev_id);
+            auto qds_manager = GUI::wxGetApp().qdsdevmanager;
+            auto qds_device = qds_manager ? qds_manager->getDevice(dev_id) : nullptr;
             if (!qds_device)
                 return -1;
             filament_colors = qds_device->m_filament_colors;
@@ -339,15 +341,17 @@ namespace Slic3r
                 wxColour tray_c = DevAmsTray::decode_color(box_filament_infos[j].color);
                 val.distance = GUI::calc_color_distance(c, tray_c);
                 //y75
-                if (toLower(filaments[i].type) != toLower(box_filament_infos[j].type)) {
+                if (toLower(filaments[i].type) != toLower(box_filament_infos[j].type) ||
+                    !GUI::QDSBoxSync::qidi_filament_ids_compatible(filaments[i].filament_id,
+                                                                   box_filament_infos[j].filament_id)) {
                     val.distance = 999999;
                     val.is_type_match = false;
                 } else {
                     if (c.Alpha() != tray_c.Alpha())
                         val.distance = 999999;
                     val.is_type_match = true;
-                    if (!filaments[i].filament_id.empty() && filaments[i].filament_id == box_filament_infos[j].filament_id)
-                        val.distance = -1.0f;
+                    val.is_exact_identity = !filaments[i].filament_id.empty() &&
+                                            filaments[i].filament_id == box_filament_infos[j].filament_id;
                 }
                 ::sprintf(buffer, "  %6.0f", val.distance);
                 line += std::string(buffer);
@@ -378,6 +382,7 @@ namespace Slic3r
         for (int k = 0; k < distance_map.size(); k++)
         {
             float min_val = INT_MAX;
+            bool picked_exact_identity = false;
             int picked_src_idx = -1;
             int picked_tar_idx = -1;
             for (int i = 0; i < distance_map.size(); i++)
@@ -405,10 +410,15 @@ namespace Slic3r
                     if (distance_map[i][j].is_same_color
                         && distance_map[i][j].is_type_match)
                     {
-                        if (min_val > distance_map[i][j].distance)
+                        if (picked_src_idx < 0 ||
+                            GUI::QDSBoxSync::prefer_filament_match(distance_map[i][j].is_exact_identity,
+                                                                   distance_map[i][j].distance,
+                                                                   picked_exact_identity,
+                                                                   min_val))
                         {
 
                             min_val = distance_map[i][j].distance;
+                            picked_exact_identity = distance_map[i][j].is_exact_identity;
                             picked_src_idx = i;
                             picked_tar_idx = j;
                         }
