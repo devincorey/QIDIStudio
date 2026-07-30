@@ -114,7 +114,8 @@ namespace Slic3r
     //y80
     int DevMappingUtil::ams_filament_mapping(const MachineObject* obj, const std::vector<FilamentInfo>& filaments, std::vector<FilamentInfo>& result, std::vector<bool> map_opt, std::vector<int> exclude_id, bool nozzle_has_ams_then_ignore_ext, bool is_from_sd_card, std::string dev_id)
     {
-        if (filaments.empty())
+        result.clear();
+        if (filaments.empty() || map_opt.size() < 4)
             return -1;
 
         /////////////////////////
@@ -128,10 +129,12 @@ namespace Slic3r
         std::vector<std::string> filament_type;
         std::vector<std::string> filament_id;
         std::vector<int> slot_id;
-        int box_count;
+        int box_count = 0;
         if (is_from_sd_card) {
             auto qds_dev = GUI::wxGetApp().qdsdevmanager;
-            auto qds_obj = qds_dev->getSelectedDevice();
+            auto qds_obj = qds_dev ? qds_dev->getSelectedDevice() : nullptr;
+            if (!qds_obj)
+                return -1;
             filament_colors = qds_obj->m_filament_colors;
             filament_type = qds_obj->m_filament_type;
             filament_id = qds_obj->m_filament_id;
@@ -141,6 +144,8 @@ namespace Slic3r
         //y80
         else if (dev_id != "") {
             auto qds_device = GUI::wxGetApp().qdsdevmanager->getDevice(dev_id);
+            if (!qds_device)
+                return -1;
             filament_colors = qds_device->m_filament_colors;
             filament_type = qds_device->m_filament_type;
             filament_id = qds_device->m_filament_id;
@@ -154,15 +159,18 @@ namespace Slic3r
             box_count = GUI::wxGetApp().plater()->box_msg.box_count;
         }
 
-        if (filament_colors.empty())
+        const size_t aligned_size = std::min({filament_colors.size(), filament_type.size(), filament_id.size(), slot_id.size()});
+        if (aligned_size == 0)
             return -1;
 
         std::vector<FilamentInfo> box_filament_infos;
-        //y77
-        for (int i = 0; i < filament_colors.size() - 1; i++) {
-            if (!filament_colors[i].empty() && slot_id[i] != -1) {
+        const size_t box_slot_count = std::min<size_t>(GUI::QDSBoxSync::max_box_slots,
+                                                       std::min<size_t>(std::max(box_count, 0) * GUI::QDSBoxSync::slots_per_box, aligned_size));
+        for (size_t i = 0; i < box_slot_count; ++i) {
+            if (slot_id[i] >= 0 && !filament_id[i].empty()) {
                 FilamentInfo box_fila_info;
-                box_fila_info.color = filament_colors[i].erase(0, 1) + "FF";
+                const auto colour = GUI::QDSBoxSync::normalize_colour(filament_colors[i]).value_or("#CECECE");
+                box_fila_info.color = colour.substr(1) + "FF";
                 box_fila_info.type = filament_type[i];
                 box_fila_info.filament_id = filament_id[i];
                 box_fila_info.slot_id = std::to_string(slot_id[i]);
@@ -173,12 +181,15 @@ namespace Slic3r
         }
 
         //y78
-        if(!right_nozzle_has_ams){
+        constexpr size_t external_index = 16;
+        if (!right_nozzle_has_ams && aligned_size > external_index &&
+            slot_id[external_index] >= 0 && !filament_id[external_index].empty()) {
             FilamentInfo box_fila_info;
-            box_fila_info.color = filament_colors[16].erase(0, 1) + "FF";
-            box_fila_info.type = filament_type[16];
-            box_fila_info.filament_id = filament_id[16];
-            box_fila_info.slot_id = std::to_string(slot_id[16]);
+            const auto colour = GUI::QDSBoxSync::normalize_colour(filament_colors[external_index]).value_or("#CECECE");
+            box_fila_info.color = colour.substr(1) + "FF";
+            box_fila_info.type = filament_type[external_index];
+            box_fila_info.filament_id = filament_id[external_index];
+            box_fila_info.slot_id = std::to_string(slot_id[external_index]);
             box_fila_info.ams_id = "";
             box_fila_info.tray_id = -1;
             box_filament_infos.push_back(box_fila_info);
@@ -245,7 +256,7 @@ namespace Slic3r
         //     }
         // }
 
-        if (map_opt[MappingOption::USE_RIGHT_EXT] || map_opt[MappingOption::USE_LEFT_EXT])
+        if (obj && (map_opt[MappingOption::USE_RIGHT_EXT] || map_opt[MappingOption::USE_LEFT_EXT]))
         {
             for (auto tray : obj->vt_slot)
             {
@@ -335,6 +346,8 @@ namespace Slic3r
                     if (c.Alpha() != tray_c.Alpha())
                         val.distance = 999999;
                     val.is_type_match = true;
+                    if (!filaments[i].filament_id.empty() && filaments[i].filament_id == box_filament_infos[j].filament_id)
+                        val.distance = -1.0f;
                 }
                 ::sprintf(buffer, "  %6.0f", val.distance);
                 line += std::string(buffer);
@@ -398,7 +411,6 @@ namespace Slic3r
                             min_val = distance_map[i][j].distance;
                             picked_src_idx = i;
                             picked_tar_idx = j;
-                            tray_filaments[picked_tar_idx].distance = min_val;
                         }
                         //y71
                         // else if (min_val == distance_map[i][j].distance && filaments[picked_src_idx].filament_id != tray_filaments[picked_tar_idx].filament_id && filaments[i].filament_id == tray_filaments[j].filament_id)

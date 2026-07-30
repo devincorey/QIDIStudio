@@ -10,11 +10,13 @@
 #include "SelectMachine.hpp"
 #include "DeviceManager.hpp"
 #include "BaseTransparentDPIFrame.hpp"
+#include "DeviceCore/QDSModalClose.hpp"
 class Button;
 class CheckBox;
 class Label;
 namespace Slic3r { namespace GUI {
 class CapsuleButton;
+class QDSDevice;
 class SyncBoxInfoDialog : public DPIDialog
 {
     enum PageType { ptColorMap = 0, ptOverride };
@@ -58,7 +60,10 @@ class SyncBoxInfoDialog : public DPIDialog
 
     std::vector<POItem> ops_auto;
     std::vector<POItem> ops_no_auto;
-    MachineObject* obj_;
+    MachineObject* obj_{nullptr};
+    std::weak_ptr<QDSDevice> m_qds_device;
+    std::map<int, std::pair<int, std::string>> m_persisted_mappings;
+    QDSModalCloseCoordinator m_modal_close;
 
 protected:
     PrintFromType     m_print_type{FROM_NORMAL};
@@ -241,6 +246,8 @@ public:
     SyncBoxInfoDialog(wxWindow *parent, SyncInfo &info);
     ~SyncBoxInfoDialog();
     void set_info(SyncInfo &info);
+    void set_qds_device(const std::shared_ptr<QDSDevice> &device) { m_qds_device = device; }
+    void set_persisted_mappings(const std::map<int, std::pair<int, std::string>> &mappings) { m_persisted_mappings = mappings; }
     void on_dpi_changed(const wxRect &suggested_rect) override;
     const SyncResult &get_result() { return m_result; }
 
@@ -260,6 +267,8 @@ public:
     void set_check_dirty_fialment(bool flag) { m_check_dirty_fialment = flag; };
 
 private:
+    void        apply_persisted_mappings();
+    void        request_modal_close(int result);
     wxBoxSizer *create_sizer_thumbnail(wxButton *image_button, bool left);
     void        update_when_change_plate(int);
     void        update_when_change_map_mode(int);

@@ -20,6 +20,7 @@
 
 #include "nlohmann/json.hpp"
 #include "libslic3r/GCode/ThumbnailData.hpp"
+#include "DeviceCore/QDSBoxSync.hpp"
 
 using namespace nlohmann;
 
@@ -148,7 +149,9 @@ class QDSDevice{
 public:
     struct Filament {
         bool hasMaterial{ false };
-        int filament_idex;
+        int filament_idex{-1};
+        int vendor_index{-1};
+        int colour_index{-1};
         std::string name;
         std::string vendor;
         std::string colorHexCode;
@@ -169,6 +172,7 @@ public:
 
     void updateBoxDataByJson(const json status);
     std::vector<float> getNozzleDiameter();
+    bool hasReportedNozzleDiameter() const { return m_has_reported_nozzle_diameter; }
     void reset_update_status(){
         box_is_update = true;
     };
@@ -231,6 +235,7 @@ public:
 
     //y78
     std::vector<float> m_nozzle_diameter { 0.4f };
+    bool m_has_reported_nozzle_diameter{ false };
 
 
 	std::string     m_print_total_duration;
@@ -274,6 +279,8 @@ public:
     std::vector<std::string> m_filament_id;
     std::vector<int> m_slot_id;
     std::vector<int> m_slot_state;
+    QDSBoxSync::BoxSnapshotInput m_box_snapshot_input;
+    QDSBoxSync::BoxSnapshot      m_box_snapshot;
 
     //cj_2 print model data
 
@@ -392,7 +399,7 @@ public:
     void setNetDevices(std::vector<NetDevice> devices);
     std::vector<NetDevice> getNetDevices();
 #endif
-    void upBoxInfoToBoxMsg(std::shared_ptr<QDSDevice>& device);
+    bool upBoxInfoToBoxMsg(std::shared_ptr<QDSDevice>& device);
     void getFileInfo(const std::string& device_id);
     void resetBoxUpdateStatus(const std::string& device_id);
 

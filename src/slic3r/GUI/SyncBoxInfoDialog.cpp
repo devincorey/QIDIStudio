@@ -4,6 +4,7 @@
 #include <wx/event.h>
 #include <wx/sizer.h>
 #include <wx/slider.h>
+#include <wx/weakref.h>
 #include <wx/dcmemory.h>
 #include "GUI_App.hpp"
 #include "Tab.hpp"
@@ -51,6 +52,7 @@ bool SyncBoxInfoDialog::Show(bool show)
 {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " SyncBoxInfoDialog begin show";
     if (show) {
+        m_modal_close.reset();
         if (m_two_image_panel) {
             m_two_image_panel->SetBackgroundColor(wxGetApp().dark_mode() ? wxColour(48, 48, 48, 100) : wxColour(246, 246, 246, 100));
             m_left_image_button->SetBackgroundColour(wxGetApp().dark_mode() ? wxColour(61, 61, 61, 0) : wxColour(238, 238, 238, 0));
@@ -60,7 +62,8 @@ bool SyncBoxInfoDialog::Show(bool show)
         if (m_options_other) { m_options_other->Hide(); }
         if (m_refresh_timer) { m_refresh_timer->Start(LIST_REFRESH_INTERVAL); }
     } else {
-        m_refresh_timer->Stop();
+        if (m_refresh_timer)
+            m_refresh_timer->Stop();
         return DPIDialog::Show(false);
     }
     // set default value when show this dialog
@@ -1003,8 +1006,7 @@ SyncBoxInfoDialog::SyncBoxInfoDialog(wxWindow *parentm, SyncInfo& info) :
 
         m_button_ok->Bind(wxEVT_COMMAND_BUTTON_CLICKED, [this](wxCommandEvent &e) {
             deal_ok();
-            EndModal(wxID_YES);
-            SetFocusIgnoringChildren();
+            request_modal_close(wxID_YES);
         });
 
         StateColor btn_bg_white(std::pair<wxColour, int>(wxColour(206, 206, 206), StateColor::Pressed), std::pair<wxColour, int>(wxColour(238, 238, 238), StateColor::Hovered),
@@ -1020,7 +1022,7 @@ SyncBoxInfoDialog::SyncBoxInfoDialog(wxWindow *parentm, SyncInfo& info) :
         bSizer_button->Add(m_button_cancel, 0, wxALIGN_RIGHT | wxLEFT | wxTOP, FromDIP(10));
 
         m_button_cancel->Bind(wxEVT_COMMAND_BUTTON_CLICKED, [this](wxCommandEvent &e) {
-            EndModal(wxID_CANCEL);
+            request_modal_close(wxID_CANCEL);
         });
 
         m_sizer_show_page->Add(bSizer_button, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(20));
@@ -1036,9 +1038,6 @@ SyncBoxInfoDialog::SyncBoxInfoDialog(wxWindow *parentm, SyncInfo& info) :
     init_timer();
     //Centre(wxBOTH);
     wxGetApp().UpdateDlgDarkUI(this);
-
-    
-    obj_ = new MachineObject("temp_obj");
 }
 
 void SyncBoxInfoDialog::check_empty_project()
@@ -1222,6 +1221,8 @@ bool SyncBoxInfoDialog::has_selector(MachineObject *obj_) const
 bool SyncBoxInfoDialog::do_ams_mapping(MachineObject* obj_)
 {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " begin do_box_mapping result";
+    const auto qds_device = m_qds_device.lock();
+    const bool qds_mode = static_cast<bool>(qds_device);
 
     std::vector<std::string> box_colors = m_plater->box_msg.filament_colors;
     for (std::string color : box_colors) {
@@ -1258,6 +1259,9 @@ bool SyncBoxInfoDialog::do_ams_mapping(MachineObject* obj_)
                                                                wxGetApp().app_config->get_bool("ams_sync_match_full_use_color_dist") ? false : true, false, "");
     }
 
+    if (qds_mode)
+        apply_persisted_mappings();
+
     if (filament_result == 0) {
         print_ams_mapping_result(m_ams_mapping_result);
         std::string ams_array;
@@ -1279,7 +1283,7 @@ bool SyncBoxInfoDialog::do_ams_mapping(MachineObject* obj_)
     } else {
         BOOST_LOG_TRIVIAL(info) << "filament_result != 0";
         // do not support ams mapping try to use order mapping
-        bool is_valid = DevMappingUtil::is_valid_mapping_result(obj_, m_ams_mapping_result);
+        bool is_valid = qds_mode ? false : DevMappingUtil::is_valid_mapping_result(obj_, m_ams_mapping_result);
         if (filament_result != 1 && !is_valid) {
             // reset invalid result
             for (int i = 0; i < m_ams_mapping_result.size(); i++) {
@@ -1294,6 +1298,41 @@ bool SyncBoxInfoDialog::do_ams_mapping(MachineObject* obj_)
     }
 
     return true;
+}
+
+void SyncBoxInfoDialog::apply_persisted_mappings()
+{
+    const auto qds_device = m_qds_device.lock();
+    if (!qds_device || m_persisted_mappings.empty())
+        return;
+
+    for (const auto &[project_filament, persisted] : m_persisted_mappings) {
+        const int &slot_index = persisted.first;
+        const std::string &preset_id = persisted.second;
+        if (!QDSBoxSync::mapping_is_current(qds_device->m_box_snapshot, slot_index, preset_id)) {
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": ignored stale mapping for project filament " << project_filament;
+            continue;
+        }
+
+        auto result = std::find_if(m_ams_mapping_result.begin(), m_ams_mapping_result.end(),
+                                   [project_filament](const FilamentInfo &info) { return info.id == project_filament; });
+        auto slot = std::find_if(qds_device->m_box_snapshot.slots.begin(), qds_device->m_box_snapshot.slots.end(),
+                                 [slot_index](const QDSBoxSync::BoxSlotSnapshot &snapshot_slot) {
+                                     return snapshot_slot.slot_index == slot_index;
+                                 });
+        if (result == m_ams_mapping_result.end() || slot == qds_device->m_box_snapshot.slots.end())
+            continue;
+
+        result->tray_id     = slot_index;
+        result->ams_id      = std::to_string(slot_index / QDSBoxSync::slots_per_box + 1);
+        result->slot_id     = std::to_string(slot_index);
+        result->filament_id = preset_id;
+        result->type        = slot->material_type.value_or("");
+        result->color       = slot->colour.value_or("#CECECE").substr(1) + "FF";
+        result->distance    = -1.0f;
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": restored project filament " << project_filament
+                                << " to Box slot " << slot_index << " with preset " << preset_id;
+    }
 }
 
 void SyncBoxInfoDialog::deal_only_exist_ext_spool() {
@@ -1804,12 +1843,16 @@ void SyncBoxInfoDialog::init_timer()
     m_refresh_timer->SetOwner(this);
 }
 
+void SyncBoxInfoDialog::request_modal_close(int result)
+{
+    m_modal_close.request(*this, m_refresh_timer, &m_mapping_popup, m_button_ok, m_button_cancel, result);
+}
+
 void SyncBoxInfoDialog::on_cancel(wxCloseEvent &event)
 {
-    if (m_mapping_popup.IsShown())
-        m_mapping_popup.Dismiss();
-
-    this->EndModal(wxID_CANCEL);
+    if (event.CanVeto())
+        event.Veto();
+    request_modal_close(wxID_CANCEL);
 }
 
 bool SyncBoxInfoDialog::is_blocking_printing(MachineObject *obj_)
@@ -2179,6 +2222,8 @@ void SyncBoxInfoDialog::update_printer_combobox(wxCommandEvent &event)
 void SyncBoxInfoDialog::on_timer(wxTimerEvent &event)
 {
     update_show_status();
+    if (!m_qds_device.expired())
+        return;
 
     /// show auto refill
     DeviceManager *dev = Slic3r::GUI::wxGetApp().getDeviceManager();
@@ -2218,6 +2263,28 @@ void SyncBoxInfoDialog::update_show_status()
         return;
     if (get_status() == PrintDialogStatus::PrintStatusSendingCanceled)
         return;
+
+    if (auto qds_device = m_qds_device.lock()) {
+        reset_timeout();
+        m_result.is_same_printer = get_printer_preset(qds_device) != nullptr;
+        if (!m_result.is_same_printer) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": connected QDS printer is incompatible with the selected profile";
+            show_status(PrintDialogStatus::PrintStatusUnsupportedPrinter);
+            return;
+        }
+        if (m_ams_mapping_result.empty())
+            do_ams_mapping(nullptr);
+        return;
+    }
+
+    if (!obj_) {
+        DeviceManager *dev = Slic3r::GUI::wxGetApp().getDeviceManager();
+        obj_ = dev ? dev->get_selected_machine() : nullptr;
+    }
+    if (!obj_) {
+        show_status(PrintDialogStatus::PrintStatusInvalidPrinter);
+        return;
+    }
 
     // NetworkAgent* agent = Slic3r::GUI::wxGetApp().getAgent();
     // DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager();
@@ -2631,14 +2698,15 @@ void SyncBoxInfoDialog::reset_and_sync_ams_list()
             } else {
                 m_mapping_popup.set_show_type(ShowType::RIGHT);
             }
-            if (obj_) {
+            const auto qds_device = m_qds_device.lock();
+            if (obj_ || qds_device) {
                 if (m_mapping_popup.IsShown())
                     return;
                 wxPoint pos = item->ClientToScreen(wxPoint(0, 0));
                 pos.y += item->GetRect().height;
                 m_mapping_popup.Move(pos);
 
-                if (obj_ && m_checkbox_list["use_ams"]->getValue() == "on") {
+                if (m_checkbox_list["use_ams"]->getValue() == "on") {
                     m_mapping_popup.set_parent_item(item);
                     m_mapping_popup.set_current_filament_id(extruder);
                     m_mapping_popup.set_material_index_str(item_index_str);
@@ -2656,7 +2724,7 @@ void SyncBoxInfoDialog::reset_and_sync_ams_list()
                     m_mapping_popup.set_tag_texture(materials[extruder]);
                     m_mapping_popup.set_send_win(this);
                     //y80
-                    m_mapping_popup.update(obj_, m_ams_mapping_result, nullptr, is_selector, std::nullopt, "");
+                    m_mapping_popup.update(obj_, m_ams_mapping_result, qds_device, is_selector, std::nullopt, "");
                     m_mapping_popup.Popup();
                 }
             }
@@ -3139,8 +3207,12 @@ void SyncBoxInfoDialog::change_default_normal(int old_filament_id, wxColour temp
 
 SyncBoxInfoDialog::~SyncBoxInfoDialog() {
     if (m_refresh_timer) {
+        m_refresh_timer->Stop();
+        Unbind(wxEVT_TIMER, &SyncBoxInfoDialog::on_timer, this);
         delete m_refresh_timer;
+        m_refresh_timer = nullptr;
     }
+    Unbind(wxEVT_CLOSE_WINDOW, &SyncBoxInfoDialog::on_cancel, this);
     BOOST_LOG_TRIVIAL(error) << "~SyncBoxInfoDialog destruction";
 }
 
