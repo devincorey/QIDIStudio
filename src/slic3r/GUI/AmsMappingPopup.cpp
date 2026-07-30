@@ -13,6 +13,7 @@
 #include "Widgets/ProgressDialog.hpp"
 #include "Widgets/RoundedRectangle.hpp"
 #include "Widgets/StaticBox.hpp"
+#include "Widgets/TransientWindowCleanup.hpp"
 
 #include <wx/progdlg.h>
 #include <wx/clipbrd.h>
@@ -1058,6 +1059,13 @@ void AmsMapingPopup::set_reset_callback(ResetCallback callback) {
      m_reset_callback = callback;
 }
 
+AmsMapingPopup::~AmsMapingPopup()
+{
+#ifdef __APPLE__
+    destroy_tip_popup();
+#endif
+}
+
 void AmsMapingPopup::show_reset_button() {
     m_reset_btn->Show();
 }
@@ -1132,6 +1140,28 @@ bool AmsMapingPopup::is_match_filament(const TrayData &tray_data, bool enforce_m
                                                      enforce_material);
 }
 
+MappingItem* AmsMapingPopup::find_mapping_item(int tray_id, int ams_id, int slot_id) const
+{
+    const auto matches = [tray_id, ams_id, slot_id](const MappingItem *item) {
+        return item && item->m_tray_data.id == tray_id &&
+               item->m_tray_data.ams_id == ams_id &&
+               item->m_tray_data.slot_id == slot_id;
+    };
+
+    for (MappingItem *item : m_mapping_item_list) {
+        if (matches(item))
+            return item;
+    }
+
+    // External-spool items have dedicated event bindings and are intentionally
+    // absent from m_mapping_item_list on non-Apple platforms.
+    if (matches(m_left_extra_slot))
+        return m_left_extra_slot;
+    if (matches(m_right_extra_slot))
+        return m_right_extra_slot;
+    return nullptr;
+}
+
 
 void AmsMapingPopup::on_left_down(wxMouseEvent &evt)
 {
@@ -1177,6 +1207,11 @@ void AmsMapingPopup::on_left_down(wxMouseEvent &evt)
 #ifdef  __APPLE__
 void AmsMapingPopup::on_mouse_move(wxMouseEvent &evt)
 {
+    if (!can_show_transient_child(this)) {
+        destroy_tip_popup();
+        evt.Skip();
+        return;
+    }
 
     auto pos = ClientToScreen(evt.GetPosition());
     wxString tip_text;
@@ -1206,13 +1241,6 @@ void AmsMapingPopup::on_mouse_move(wxMouseEvent &evt)
             m_tip_label->SetForegroundColour(*wxBLACK);
             sizer->Add(m_tip_label, 0, wxALL, 4);
             m_tip_popup->SetSizer(sizer);
-            m_tip_popup->Bind(wxEVT_IDLE, [this](wxIdleEvent &) {
-                if (!IsShown() && m_tip_popup) {
-                    m_tip_popup->Destroy();
-                    m_tip_popup = nullptr;
-                    m_tip_label = nullptr;
-                    }
-            });
         }
 
 
@@ -1229,13 +1257,26 @@ void AmsMapingPopup::on_mouse_move(wxMouseEvent &evt)
         if (m_tip_popup && m_tip_popup->IsShown()) m_tip_popup->Hide();
     }
 }
+
+void AmsMapingPopup::destroy_tip_popup()
+{
+    m_tip_label = nullptr;
+    destroy_transient_popup(m_tip_popup);
+}
 #endif
+
+void AmsMapingPopup::Dismiss()
+{
+    PopupWindow::Dismiss();
+#ifdef __APPLE__
+    destroy_tip_popup();
+#endif
+}
 
 void AmsMapingPopup::OnDismiss()
 {
 #ifdef __APPLE__
-    if (m_tip_popup && m_tip_popup->IsShown ())
-        m_tip_popup->Hide();
+    destroy_tip_popup();
 #endif
 }
 

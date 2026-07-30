@@ -445,7 +445,7 @@ void AmsMapingPopup::update_mapping_items(MachineObject* obj, const std::vector<
     }
 
     // External spool is not displayed for an empty firmware placeholder.
-    constexpr size_t external_index = 16;
+    const size_t external_index = static_cast<size_t>(QDSBoxSync::external_spool_slot);
     m_has_external_spool = aligned_size > external_index && slot_state[external_index] != 0 &&
                            slot_id[external_index] >= 0 && !filament_id[external_index].empty();
     if (m_has_external_spool) {
