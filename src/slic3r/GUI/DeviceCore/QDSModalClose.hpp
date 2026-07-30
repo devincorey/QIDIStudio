@@ -13,7 +13,14 @@ namespace Slic3r { namespace GUI {
 class QDSModalCloseCoordinator
 {
 public:
-    void reset() { m_closing = false; }
+    void reset(wxWindow *primary_action = nullptr, wxWindow *cancel_action = nullptr)
+    {
+        m_closing = false;
+        if (primary_action)
+            primary_action->Enable();
+        if (cancel_action)
+            cancel_action->Enable();
+    }
     bool closing() const { return m_closing; }
 
     bool request(wxDialog &dialog,

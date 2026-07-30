@@ -3,6 +3,7 @@
 #include <wx/app.h>
 #include <wx/dialog.h>
 #include <wx/popupwin.h>
+#include <wx/button.h>
 #include <wx/timer.h>
 
 #include "slic3r/GUI/DeviceCore/QDSModalClose.hpp"
@@ -17,11 +18,13 @@ public:
 
 wxIMPLEMENT_APP_NO_MAIN(LifecycleTestApp);
 
-bool run_cycle(bool use_window_close)
+bool run_cycles(bool use_window_close, int requested_result = wxID_CANCEL)
 {
     auto *dialog = new wxDialog(nullptr, wxID_ANY, "QDS modal lifecycle");
     auto *popup  = new wxPopupTransientWindow(dialog, wxBORDER_NONE);
     auto *timer  = new wxTimer(dialog);
+    auto *primary_action = new wxButton(dialog, wxID_OK, "OK");
+    auto *cancel_action  = new wxButton(dialog, wxID_CANCEL, "Cancel");
     popup->SetSize(wxSize(20, 20));
 
     int timer_events = 0;
@@ -33,24 +36,32 @@ bool run_cycle(bool use_window_close)
     dialog->Bind(wxEVT_CLOSE_WINDOW, [&](wxCloseEvent &event) {
         if (event.CanVeto())
             event.Veto();
-        accepted_requests += close.request(*dialog, timer, popup, nullptr, nullptr, wxID_CANCEL) ? 1 : 0;
-        accepted_requests += close.request(*dialog, timer, popup, nullptr, nullptr, wxID_OK) ? 1 : 0;
+        accepted_requests += close.request(*dialog, timer, popup, primary_action, cancel_action, wxID_CANCEL) ? 1 : 0;
+        accepted_requests += close.request(*dialog, timer, popup, primary_action, cancel_action, wxID_OK) ? 1 : 0;
     });
 
-    wxTheApp->CallAfter([&]() {
-        popup->Popup();
-        if (use_window_close) {
-            dialog->Close();
-        } else {
-            accepted_requests += close.request(*dialog, timer, popup, nullptr, nullptr, wxID_CANCEL) ? 1 : 0;
-            accepted_requests += close.request(*dialog, timer, popup, nullptr, nullptr, wxID_OK) ? 1 : 0;
-        }
-    });
+    bool passed = true;
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        close.reset(primary_action, cancel_action);
+        timer->Start(5);
+        passed = passed && primary_action->IsEnabled() && cancel_action->IsEnabled();
+        wxTheApp->CallAfter([&]() {
+            popup->Popup();
+            if (use_window_close) {
+                dialog->Close();
+            } else {
+                accepted_requests += close.request(*dialog, timer, popup, primary_action, cancel_action, requested_result) ? 1 : 0;
+                accepted_requests += close.request(*dialog, timer, popup, primary_action, cancel_action, wxID_CANCEL) ? 1 : 0;
+            }
+        });
 
-    const int modal_result = dialog->ShowModal();
+        const int modal_result = dialog->ShowModal();
+        const int expected_result = use_window_close ? wxID_CANCEL : requested_result;
+        passed = passed && modal_result == expected_result && accepted_requests == cycle + 1 && close.closing() &&
+                 !primary_action->IsEnabled() && !cancel_action->IsEnabled() &&
+                 !timer->IsRunning() && !popup->IsShown();
+    }
     const int events_after_close = timer_events;
-    const bool passed = modal_result == wxID_CANCEL && accepted_requests == 1 && close.closing() &&
-                        !timer->IsRunning() && !popup->IsShown();
 
     popup->Destroy();
     delete timer;
@@ -68,22 +79,24 @@ int main(int argc, char **argv)
         std::cerr << "wxEntryStart failed\n";
         return 1;
     }
+    (void) wxGetApp();
     if (!wxTheApp || !wxTheApp->CallOnInit()) {
         std::cerr << "wxApp initialization failed\n";
         wxEntryCleanup();
         return 1;
     }
 
-    const bool cancel_passed = run_cycle(false);
-    const bool close_passed  = run_cycle(true);
+    const bool cancel_passed = run_cycles(false);
+    const bool close_passed  = run_cycles(true);
+    const bool success_passed = run_cycles(false, wxID_YES);
 
     wxTheApp->OnExit();
     wxEntryCleanup();
 
-    if (!cancel_passed || !close_passed) {
+    if (!cancel_passed || !close_passed || !success_passed) {
         std::cerr << "QDS modal lifecycle cleanup failed\n";
         return 1;
     }
-    std::cout << "QDS modal lifecycle cleanup passed twice\n";
+    std::cout << "QDS modal lifecycle cleanup passed for cancel, window-close, and success paths\n";
     return 0;
 }

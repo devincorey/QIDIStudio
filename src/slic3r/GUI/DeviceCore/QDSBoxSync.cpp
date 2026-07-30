@@ -5,6 +5,8 @@
 #include <cmath>
 #include <set>
 
+#include <nlohmann/json.hpp>
+
 namespace Slic3r::GUI::QDSBoxSync {
 
 namespace {
@@ -43,9 +45,40 @@ std::string normalize_model_name(const std::string &model)
     return normalized;
 }
 
+std::string mapping_device_identity(const std::string &host, const std::string &runtime_id)
+{
+    const auto normalize = [](const std::string &value) {
+        const auto first = std::find_if_not(value.begin(), value.end(), [](unsigned char ch) { return std::isspace(ch); });
+        const auto last = std::find_if_not(value.rbegin(), value.rend(), [](unsigned char ch) { return std::isspace(ch); }).base();
+        if (first >= last)
+            return std::string{};
+
+        std::string identity(first, last);
+        std::transform(identity.begin(), identity.end(), identity.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return identity;
+    };
+
+    std::string identity = normalize(host);
+    return identity.empty() ? normalize(runtime_id) : identity;
+}
+
 bool valid_catalog_index(int index, std::size_t catalog_size)
 {
     return index >= 0 && static_cast<std::size_t>(index) < catalog_size;
+}
+
+bool qidi_filament_ids_compatible(const std::string &project_preset_id, const std::string &slot_preset_id)
+{
+    return project_preset_id.rfind("QD_", 0) != 0 || project_preset_id == slot_preset_id;
+}
+
+bool prefer_filament_match(bool candidate_exact, double candidate_colour_distance,
+                           bool current_exact, double current_colour_distance)
+{
+    if (candidate_exact != current_exact)
+        return candidate_exact;
+    return candidate_colour_distance < current_colour_distance;
 }
 
 std::optional<std::string> normalize_colour(const std::optional<std::string> &colour)
@@ -53,13 +86,14 @@ std::optional<std::string> normalize_colour(const std::optional<std::string> &co
     if (!colour || (colour->size() != 7 && colour->size() != 9) || colour->front() != '#')
         return std::nullopt;
 
-    std::string normalized = colour->substr(0, 7);
+    std::string normalized = *colour;
     for (size_t i = 1; i < normalized.size(); ++i) {
         const unsigned char ch = static_cast<unsigned char>(normalized[i]);
         if (!std::isxdigit(ch))
             return std::nullopt;
         normalized[i] = static_cast<char>(std::toupper(ch));
     }
+    normalized.resize(7);
     return normalized;
 }
 
@@ -77,36 +111,44 @@ CompatibilityResult resolve_compatibility(const PrinterMetadata &metadata,
 {
     CompatibilityResult result;
     const std::string selected = normalize_model_name(selected_model);
-    if (selected.empty() || selected_nozzle <= 0.0) {
+    if (selected.empty() || !std::isfinite(selected_nozzle) || selected_nozzle <= 0.0 ||
+        !std::isfinite(nozzle_tolerance) || nozzle_tolerance < 0.0) {
         result.reason = "selected printer profile is incomplete";
         return result;
     }
+    const bool supported_fallback = selected == "xplus4" && std::fabs(selected_nozzle - 0.4) <= nozzle_tolerance;
 
     const std::string configured = metadata.configured_model ? normalize_model_name(*metadata.configured_model) : std::string{};
-    const std::string reported   = metadata.reported_model ? normalize_model_name(*metadata.reported_model) : std::string{};
-    if (!configured.empty() && !reported.empty() && configured != reported) {
-        result.reason = "configured and reported printer models contradict each other";
-        return result;
-    }
-
-    const std::string connected = !reported.empty() ? reported : configured;
+    const std::string connected = configured;
     if (!connected.empty() && connected != selected) {
         result.reason = "connected printer model contradicts the selected profile";
+        return result;
+    }
+    if (connected.empty() && !supported_fallback) {
+        result.reason = "missing model metadata fallback is limited to the X-Plus 4 0.4 mm profile";
         return result;
     }
 
     result.effective_model = selected_model;
     result.used_selected_model_fallback = connected.empty();
 
-    if (metadata.reported_nozzles.empty()) {
+    if (!metadata.reported_nozzles) {
+        if (!supported_fallback) {
+            result.reason = "missing nozzle metadata fallback is limited to the X-Plus 4 0.4 mm profile";
+            return result;
+        }
         result.effective_nozzle = selected_nozzle;
         result.used_selected_nozzle_fallback = true;
     } else {
-        const auto match = std::find_if(metadata.reported_nozzles.begin(), metadata.reported_nozzles.end(),
+        if (metadata.reported_nozzles->empty()) {
+            result.reason = "reported nozzle metadata is present but invalid";
+            return result;
+        }
+        const auto match = std::find_if(metadata.reported_nozzles->begin(), metadata.reported_nozzles->end(),
                                         [selected_nozzle, nozzle_tolerance](double nozzle) {
                                             return std::fabs(nozzle - selected_nozzle) <= nozzle_tolerance;
                                         });
-        if (match == metadata.reported_nozzles.end()) {
+        if (match == metadata.reported_nozzles->end()) {
             result.reason = "reported nozzle diameter contradicts the selected profile";
             return result;
         }
@@ -131,7 +173,7 @@ BoxSnapshot normalize_snapshot(const BoxSnapshotInput &input)
     const int usable_slots = snapshot.box_count * slots_per_box;
     std::set<int> seen;
     std::vector<RawSlot> ordered = input.slots;
-    std::sort(ordered.begin(), ordered.end(), [](const RawSlot &lhs, const RawSlot &rhs) {
+    std::stable_sort(ordered.begin(), ordered.end(), [](const RawSlot &lhs, const RawSlot &rhs) {
         return lhs.slot_index < rhs.slot_index;
     });
 
@@ -149,8 +191,10 @@ BoxSnapshot normalize_snapshot(const BoxSnapshotInput &input)
             continue;
 
         BoxSlotSnapshot slot = normalize_slot(raw, input.box_id);
-        if (!slot.filament_preset_id)
+        if (!slot.filament_preset_id) {
             snapshot.diagnostics.emplace_back("occupied slot has no valid exact filament preset id");
+            continue;
+        }
         if (!slot.colour)
             snapshot.diagnostics.emplace_back("occupied slot has no valid colour");
         snapshot.slots.emplace_back(std::move(slot));
@@ -158,10 +202,14 @@ BoxSnapshot normalize_snapshot(const BoxSnapshotInput &input)
 
     if (input.external_spool && input.external_spool->occupied &&
         (input.external_spool->filament_index > 0 || !input.external_spool->material_name.empty() || !input.external_spool->material_type.empty())) {
-        snapshot.external_spool = normalize_slot(*input.external_spool, input.box_id);
+        BoxSlotSnapshot external = normalize_slot(*input.external_spool, input.box_id);
+        if (external.filament_preset_id && (external.material_name || external.material_type))
+            snapshot.external_spool = std::move(external);
+        else
+            snapshot.diagnostics.emplace_back("ignored incomplete external spool record");
     }
 
-    if (input.loaded_slot && *input.loaded_slot >= 0 && *input.loaded_slot < max_box_slots)
+    if (input.loaded_slot && *input.loaded_slot >= 0 && *input.loaded_slot < usable_slots)
         snapshot.loaded_slot = input.loaded_slot;
     return snapshot;
 }
@@ -215,6 +263,83 @@ bool mapping_is_current(const BoxSnapshot &snapshot, int slot_index, const std::
     const auto iter = std::find_if(snapshot.slots.begin(), snapshot.slots.end(),
                                    [slot_index](const BoxSlotSnapshot &slot) { return slot.slot_index == slot_index; });
     return iter != snapshot.slots.end() && iter->filament_preset_id && *iter->filament_preset_id == filament_preset_id;
+}
+
+std::string serialize_mapping_preferences(const MappingContext &context, const MappingPreferences &preferences)
+{
+    nlohmann::json stored = {
+        {"kind", "qds_box_mapping"},
+        {"version", 2},
+        {"printer_profile", context.printer_profile},
+        {"device_id", context.device_id},
+        {"mappings", nlohmann::json::array()}
+    };
+    for (const auto &entry : preferences) {
+        const MappingPreference &preference = entry.second;
+        stored["mappings"].push_back({
+            {"project_filament", preference.project_filament},
+            {"project_preset", preference.project_preset},
+            {"slot", preference.slot_index},
+            {"preset_id", preference.slot_preset_id}
+        });
+    }
+    return stored.dump();
+}
+
+MappingPreferences deserialize_mapping_preferences(const std::string &stored,
+                                                    const MappingContext &context,
+                                                    std::vector<std::string> *diagnostics)
+{
+    auto diagnose = [diagnostics](const std::string &message) {
+        if (diagnostics)
+            diagnostics->push_back(message);
+    };
+
+    MappingPreferences preferences;
+    if (stored.empty())
+        return preferences;
+
+    try {
+        const nlohmann::json data = nlohmann::json::parse(stored);
+        if (!data.is_object() || data.value("kind", "") != "qds_box_mapping" || data.value("version", 0) != 2) {
+            diagnose("ignored unsupported QDS mapping schema");
+            return preferences;
+        }
+        if (data.value("printer_profile", "") != context.printer_profile || data.value("device_id", "") != context.device_id) {
+            diagnose("ignored QDS mappings saved for another printer context");
+            return preferences;
+        }
+        if (!data.contains("mappings") || !data["mappings"].is_array()) {
+            diagnose("ignored QDS mappings with no mapping array");
+            return preferences;
+        }
+
+        for (const auto &entry : data["mappings"]) {
+            if (!entry.is_object() || !entry.contains("project_filament") || !entry.contains("project_preset") ||
+                !entry.contains("slot") || !entry.contains("preset_id") ||
+                !entry["project_filament"].is_number_integer() || !entry["project_preset"].is_string() ||
+                !entry["slot"].is_number_integer() || !entry["preset_id"].is_string()) {
+                diagnose("ignored malformed QDS mapping entry");
+                continue;
+            }
+
+            MappingPreference preference;
+            preference.project_filament = entry["project_filament"].get<int>();
+            preference.project_preset   = entry["project_preset"].get<std::string>();
+            preference.slot_index       = entry["slot"].get<int>();
+            preference.slot_preset_id   = entry["preset_id"].get<std::string>();
+            if (preference.project_filament < 0 || preference.project_preset.empty() ||
+                preference.slot_index < 0 || preference.slot_index >= max_box_slots || preference.slot_preset_id.empty()) {
+                diagnose("ignored invalid QDS mapping entry");
+                continue;
+            }
+            if (!preferences.emplace(preference.project_filament, std::move(preference)).second)
+                diagnose("ignored duplicate QDS project-filament mapping");
+        }
+    } catch (const std::exception &) {
+        diagnose("ignored malformed QDS mapping JSON");
+    }
+    return preferences;
 }
 
 } // namespace Slic3r::GUI::QDSBoxSync

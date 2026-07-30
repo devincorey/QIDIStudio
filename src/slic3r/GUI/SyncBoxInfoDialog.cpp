@@ -52,7 +52,7 @@ bool SyncBoxInfoDialog::Show(bool show)
 {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " SyncBoxInfoDialog begin show";
     if (show) {
-        m_modal_close.reset();
+        m_modal_close.reset(m_button_ok, m_button_cancel);
         if (m_two_image_panel) {
             m_two_image_panel->SetBackgroundColor(wxGetApp().dark_mode() ? wxColour(48, 48, 48, 100) : wxColour(246, 246, 246, 100));
             m_left_image_button->SetBackgroundColour(wxGetApp().dark_mode() ? wxColour(61, 61, 61, 0) : wxColour(238, 238, 238, 0));
@@ -1224,6 +1224,7 @@ bool SyncBoxInfoDialog::do_ams_mapping(MachineObject* obj_)
     const auto qds_device = m_qds_device.lock();
     const bool qds_mode = static_cast<bool>(qds_device);
 
+    m_cur_colors_in_thumbnail.clear();
     std::vector<std::string> box_colors = m_plater->box_msg.filament_colors;
     for (std::string color : box_colors) {
         if (!color.empty()) {
@@ -1306,9 +1307,19 @@ void SyncBoxInfoDialog::apply_persisted_mappings()
     if (!qds_device || m_persisted_mappings.empty())
         return;
 
-    for (const auto &[project_filament, persisted] : m_persisted_mappings) {
-        const int &slot_index = persisted.first;
-        const std::string &preset_id = persisted.second;
+    for (const auto &entry : m_persisted_mappings) {
+        const int project_filament = entry.first;
+        const QDSBoxSync::MappingPreference &preference = entry.second;
+        if (!wxGetApp().preset_bundle || project_filament < 0 ||
+            static_cast<size_t>(project_filament) >= wxGetApp().preset_bundle->filament_presets.size() ||
+            wxGetApp().preset_bundle->filament_presets[project_filament] != preference.project_preset) {
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": ignored mapping for a changed project filament "
+                                    << project_filament;
+            continue;
+        }
+
+        const int slot_index = preference.slot_index;
+        const std::string &preset_id = preference.slot_preset_id;
         if (!QDSBoxSync::mapping_is_current(qds_device->m_box_snapshot, slot_index, preset_id)) {
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": ignored stale mapping for project filament " << project_filament;
             continue;
@@ -1733,7 +1744,8 @@ void SyncBoxInfoDialog::update_print_error_info(int code, std::string msg, std::
 void SyncBoxInfoDialog::show_status(PrintDialogStatus status, std::vector<wxString> params)
 {
     if (m_print_status != status) {
-        m_result.is_same_printer = true;
+        if (m_qds_device.expired())
+            m_result.is_same_printer = true;
         BOOST_LOG_TRIVIAL(info) << "select_machine_dialog: show_status = " << status << "(" << PrePrintChecker::get_print_status_info(status) << ")";
     }
     m_print_status = status;
@@ -2221,6 +2233,9 @@ void SyncBoxInfoDialog::update_printer_combobox(wxCommandEvent &event)
 
 void SyncBoxInfoDialog::on_timer(wxTimerEvent &event)
 {
+    if (m_modal_close.closing())
+        return;
+
     update_show_status();
     if (!m_qds_device.expired())
         return;

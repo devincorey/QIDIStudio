@@ -2,6 +2,7 @@
 #define slic3r_GUI_DeviceCore_QDSBoxSync_hpp_
 
 #include <cstddef>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -15,8 +16,8 @@ constexpr int max_box_slots = slots_per_box * max_box_count;
 struct PrinterMetadata
 {
     std::optional<std::string> configured_model;
-    std::optional<std::string> reported_model;
-    std::vector<double>        reported_nozzles;
+    // nullopt means absent; an engaged empty vector means present but invalid.
+    std::optional<std::vector<double>> reported_nozzles;
 };
 
 struct CompatibilityResult
@@ -97,8 +98,28 @@ struct BoxSnapshot
     std::vector<std::string>       diagnostics;
 };
 
+struct MappingContext
+{
+    std::string printer_profile;
+    std::string device_id;
+};
+
+struct MappingPreference
+{
+    int         project_filament{-1};
+    std::string project_preset;
+    int         slot_index{-1};
+    std::string slot_preset_id;
+};
+
+using MappingPreferences = std::map<int, MappingPreference>;
+
 std::string normalize_model_name(const std::string &model);
+std::string mapping_device_identity(const std::string &host, const std::string &runtime_id);
 bool valid_catalog_index(int index, std::size_t catalog_size);
+bool qidi_filament_ids_compatible(const std::string &project_preset_id, const std::string &slot_preset_id);
+bool prefer_filament_match(bool candidate_exact, double candidate_colour_distance,
+                           bool current_exact, double current_colour_distance);
 std::optional<std::string> normalize_colour(const std::optional<std::string> &colour);
 std::optional<std::string> make_filament_preset_id(const std::string &box_id, int vendor_index, int filament_index);
 
@@ -110,6 +131,10 @@ CompatibilityResult resolve_compatibility(const PrinterMetadata &metadata,
 BoxSnapshot normalize_snapshot(const BoxSnapshotInput &input);
 BoxSnapshotInput merge_snapshot_patch(BoxSnapshotInput input, const BoxSnapshotPatch &patch);
 bool mapping_is_current(const BoxSnapshot &snapshot, int slot_index, const std::string &filament_preset_id);
+std::string serialize_mapping_preferences(const MappingContext &context, const MappingPreferences &preferences);
+MappingPreferences deserialize_mapping_preferences(const std::string &stored,
+                                                    const MappingContext &context,
+                                                    std::vector<std::string> *diagnostics = nullptr);
 
 } // namespace Slic3r::GUI::QDSBoxSync
 
