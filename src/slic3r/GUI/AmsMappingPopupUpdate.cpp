@@ -349,13 +349,22 @@ void AmsMapingPopup::update_mapping_items(MachineObject* obj, const std::vector<
     std::vector<int> slot_id;
     std::vector<int> slot_state;
     int box_count = 0;
+    QDSBoxSync::BoxSnapshot box_snapshot;
+    bool has_qds_snapshot = false;
     if(qds_obj != nullptr){
-        filament_colors = qds_obj->m_filament_colors;
-        filament_type = qds_obj->m_filament_type;
-        filament_id = qds_obj->m_filament_id;
-        slot_id = qds_obj->m_slot_id;
-        slot_state = qds_obj->m_slot_state;
-        box_count = qds_obj->m_box_count;
+        const auto box_state = qds_obj->getBoxMappingState();
+        if (!box_state.ready) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": QDS Box mapping state is not ready";
+            return;
+        }
+        filament_colors = box_state.filament_colors;
+        filament_type = box_state.filament_type;
+        filament_id = box_state.filament_id;
+        slot_id = box_state.slot_id;
+        slot_state = box_state.slot_state;
+        box_count = box_state.box_count;
+        box_snapshot = box_state.snapshot;
+        has_qds_snapshot = true;
 //y80
     } else if(!dev_id.empty()){
         auto qds_manager = GUI::wxGetApp().qdsdevmanager;
@@ -364,12 +373,19 @@ void AmsMapingPopup::update_mapping_items(MachineObject* obj, const std::vector<
             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": QDS device disappeared before mapping popup update";
             return;
         }
-        filament_colors = qds_device->m_filament_colors;
-        filament_type = qds_device->m_filament_type;
-        filament_id = qds_device->m_filament_id;
-        slot_id = qds_device->m_slot_id;
-        slot_state = qds_device->m_slot_state;
-        box_count = qds_device->m_box_count;
+        const auto box_state = qds_device->getBoxMappingState();
+        if (!box_state.ready) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": QDS Box mapping state is not ready";
+            return;
+        }
+        filament_colors = box_state.filament_colors;
+        filament_type = box_state.filament_type;
+        filament_id = box_state.filament_id;
+        slot_id = box_state.slot_id;
+        slot_state = box_state.slot_state;
+        box_count = box_state.box_count;
+        box_snapshot = box_state.snapshot;
+        has_qds_snapshot = true;
     }
     else {
         filament_colors = GUI::wxGetApp().plater()->box_msg.filament_colors;
@@ -405,10 +421,11 @@ void AmsMapingPopup::update_mapping_items(MachineObject* obj, const std::vector<
             td.colour        = DevAmsTray::decode_color(colour.substr(1) + "FF");
             td.name          = occupied ? filament_type[i] : "";
             td.filament_type = occupied ? filament_type[i] : "";
-            if (occupied && qds_obj) {
-                const auto snapshot_slot = std::find_if(qds_obj->m_box_snapshot.slots.begin(), qds_obj->m_box_snapshot.slots.end(),
+            td.filament_preset_id = occupied ? filament_id[i] : "";
+            if (occupied && has_qds_snapshot) {
+                const auto snapshot_slot = std::find_if(box_snapshot.slots.begin(), box_snapshot.slots.end(),
                                                         [i](const QDSBoxSync::BoxSlotSnapshot &slot) { return slot.slot_index == i; });
-                if (snapshot_slot != qds_obj->m_box_snapshot.slots.end() && snapshot_slot->material_name)
+                if (snapshot_slot != box_snapshot.slots.end() && snapshot_slot->material_name)
                     td.name = *snapshot_slot->material_name;
             }
             td.ctype = TrayType::NORMAL;
@@ -447,6 +464,7 @@ void AmsMapingPopup::update_mapping_items(MachineObject* obj, const std::vector<
         td.colour = DevAmsTray::decode_color(colour.substr(1) + "FF");
         td.name = filament_type[external_index];
         td.filament_type = filament_type[external_index];
+        td.filament_preset_id = filament_id[external_index];
         td.ctype = TrayType::NORMAL;
         m_right_extra_slot->send_win = send_win;
         add_ext_ams_mapping(td, m_right_extra_slot);
@@ -743,7 +761,7 @@ void AmsMapingPopup::add_ams_mapping(std::vector<TrayData> tray_data,
 
         // check filament type
         if (can_pick_the_item) {
-            if (tray_data[i].type == NORMAL && !is_match_material(tray_data[i].filament_type)){
+            if (tray_data[i].type == NORMAL && !is_match_filament(tray_data[i])){
                 can_pick_the_item = false;
             } else if(tray_data[i].type == EMPTY){
                 can_pick_the_item = false;
@@ -787,7 +805,7 @@ void AmsMapingPopup::add_ext_ams_mapping(TrayData tray_data, MappingItem* item)
 #endif
     // set button
     if (tray_data.type == NORMAL) {
-        if (is_match_material(tray_data.filament_type)) {
+        if (is_match_filament(tray_data, m_ext_mapping_filatype_check)) {
             item->set_data(m_tag_material, tray_data.colour, tray_data.name, false, tray_data);
         } else {
             item->set_data(m_tag_material, m_ext_mapping_filatype_check ? wxColour(0xEE, 0xEE, 0xEE) : tray_data.colour, tray_data.name, false, tray_data, true);
@@ -812,8 +830,8 @@ void AmsMapingPopup::add_ext_ams_mapping(TrayData tray_data, MappingItem* item)
         item->Bind(wxEVT_LEFT_DOWN, [this, item](wxMouseEvent &) {
             if (!item->GetParent() || !item->GetParent()->IsEnabled())
                 return;
-            if (item->m_tray_data.type == NORMAL && m_ext_mapping_filatype_check &&
-                !is_match_material(item->m_tray_data.filament_type))
+            if (item->m_tray_data.type == NORMAL &&
+                !is_match_filament(item->m_tray_data, m_ext_mapping_filatype_check))
                 return;
             item->send_event(m_current_filament_id);
             Dismiss();
