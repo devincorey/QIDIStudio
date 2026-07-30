@@ -36,6 +36,7 @@
 
 #include "DeviceCore/DevManager.h"
 #include "DeviceCore/DevMapping.h"
+#include "Widgets/TransientWindowCleanup.hpp"
 
 #include "DeviceCore/DevUtilBackend.h"
 
@@ -44,6 +45,7 @@
 #include <wx/display.h>
 #include <wx/progdlg.h>
 #include <wx/clipbrd.h>
+#include <wx/weakref.h>
 #include <wx/dcgraph.h>
 #include <wx/mstream.h>
 #include <miniz.h>
@@ -2157,8 +2159,7 @@ void SelectMachineDialog::init_timer()
 
 void SelectMachineDialog::on_cancel(wxCloseEvent &event)
 {
-    if (m_mapping_popup.IsShown())
-        m_mapping_popup.Dismiss();
+    dismiss_transient_popups();
 
     if (m_print_job) {
         if (m_print_job->is_running()) {
@@ -3602,19 +3603,23 @@ void SelectMachineDialog::update_timelapse_folder_btn_icon()
 void SelectMachineDialog::show_timelapse_folder_popup()
 {
     if (m_timelapse_storage_popup && m_timelapse_storage_popup->IsShown()) {
-        m_timelapse_storage_popup->Dismiss();
+        destroy_timelapse_storage_popup();
+        update_timelapse_folder_btn_icon();
         return;
     }
 
+    destroy_timelapse_storage_popup();
+
     // build popup with rounded corners + light border
-    m_timelapse_storage_popup = new PopupWindow(this, wxBORDER_NONE);
+    PopupWindow *popup = new PopupWindow(this, wxBORDER_NONE);
+    m_timelapse_storage_popup = popup;
     m_timelapse_storage_popup->SetBackgroundColour(wxColour(0xF0, 0xF0, 0xF0));
-    m_timelapse_storage_popup->Bind(wxEVT_PAINT, [this](wxPaintEvent&) {
-        wxPaintDC dc(m_timelapse_storage_popup);
-        auto size = m_timelapse_storage_popup->GetSize();
+    m_timelapse_storage_popup->Bind(wxEVT_PAINT, [popup](wxPaintEvent&) {
+        wxPaintDC dc(popup);
+        auto size = popup->GetSize();
         dc.SetPen(wxPen(wxColour(0xCE, 0xCE, 0xCE)));
         dc.SetBrush(wxBrush(wxColour(0xF0, 0xF0, 0xF0)));
-        dc.DrawRoundedRectangle(0, 0, size.x, size.y, FromDIP(8));
+        dc.DrawRoundedRectangle(0, 0, size.x, size.y, popup->FromDIP(8));
     });
 
     auto* panel = new wxPanel(m_timelapse_storage_popup, wxID_ANY);
@@ -3630,6 +3635,7 @@ void SelectMachineDialog::show_timelapse_folder_popup()
     if (!has_sdcard && m_timelapse_storage == "external")
         m_timelapse_storage = "internal";
 
+    wxWeakRef<SelectMachineDialog> weak_dialog(this);
     auto make_item = [&](const wxString& label, const std::string& val, bool enabled) {
         auto* radio = new wxRadioButton(panel, wxID_ANY, label, wxDefaultPosition, wxDefaultSize,
             val == "internal" ? wxRB_GROUP : 0);
@@ -3640,13 +3646,16 @@ void SelectMachineDialog::show_timelapse_folder_popup()
         sizer->Add(radio, 0, wxALIGN_CENTER_VERTICAL);
 
         if (enabled) {
-            radio->Bind(wxEVT_RADIOBUTTON, [this, val](wxCommandEvent&) {
-                m_timelapse_storage = val;
-                update_timelapse_folder_btn_icon();
-                if (m_timelapse_storage_popup) m_timelapse_storage_popup->Dismiss();
+            radio->Bind(wxEVT_RADIOBUTTON, [weak_dialog, val](wxCommandEvent&) mutable {
+                if (!weak_dialog)
+                    return;
+                weak_dialog->m_timelapse_storage = val;
+                weak_dialog->update_timelapse_folder_btn_icon();
+                weak_dialog->destroy_timelapse_storage_popup();
                 DeviceManager* dev = wxGetApp().getDeviceManager();
                 MachineObject* obj = dev ? dev->get_selected_machine() : nullptr;
-                if (obj) check_timelapse_storage_warning(obj);
+                if (obj)
+                    weak_dialog->check_timelapse_storage_warning(obj);
             });
         }
     };
@@ -3664,11 +3673,8 @@ void SelectMachineDialog::show_timelapse_folder_popup()
     m_timelapse_storage_popup->Fit();
 
     // restore normal icon when popup is dismissed
-    m_timelapse_storage_popup->Bind(wxEVT_SHOW, [this](wxShowEvent& e) {
-        if (!e.IsShown())
-            update_timelapse_folder_btn_icon();
-        e.Skip();
-    });
+    m_timelapse_storage_popup->Bind(wxEVT_SHOW,
+        &SelectMachineDialog::on_timelapse_storage_popup_show, this);
 
     wxPoint pos = m_timelapse_folder_btn->ClientToScreen(wxPoint(0, m_timelapse_folder_btn->GetSize().GetHeight()));
     m_timelapse_storage_popup->Position(pos, wxSize(0, 0));
@@ -4097,8 +4103,7 @@ void SelectMachineDialog::on_send_print()
     m_is_canceled = false;
     Enable_Send_Button(false);
 
-    if (m_mapping_popup.IsShown())
-        m_mapping_popup.Dismiss();
+    dismiss_transient_popups();
 
     if (m_print_type == PrintFromType::FROM_NORMAL && m_is_in_sending_mode){
         return;
@@ -4112,13 +4117,39 @@ void SelectMachineDialog::on_send_print()
     DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager();
     if (!dev) return;
 
-    MachineObject* obj_ = dev->get_selected_machine();
-    assert(obj_->get_dev_id() == m_printer_last_select);
-    if (obj_ == nullptr) { return; }
-
-    if (!DevMappingUtil::is_valid_mapping_result(obj_, m_ams_mapping_result)) {
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << "print_job: invalid mapping";
+    MachineObject *obj_ = dev->get_my_machine(m_printer_last_select);
+    if (!obj_) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": selected printer disappeared before send";
         return;
+    }
+
+    auto qds_device = get_current_qds_device();
+    QDSBoxSync::MappingValidationResult qds_mapping_validation;
+    std::uint64_t qds_mapping_generation = 0;
+    if (qds_device) {
+        const auto box_state = qds_device->getBoxMappingState();
+        if (!box_state.ready) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+                                     << ": QDS Box snapshot is unavailable at send";
+            Enable_Send_Button(true);
+            show_status(PrintDialogStatus::PrintStatusAmsMappingInvalid);
+            return;
+        }
+        qds_mapping_generation = box_state.generation;
+        qds_mapping_validation = QDSBoxSync::validate_mapping_result(box_state.snapshot,
+                                                                    m_ams_mapping_result);
+        if (!qds_mapping_validation.valid) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": invalid QDS mapping: "
+                                     << qds_mapping_validation.reason;
+            Enable_Send_Button(true);
+            show_status(PrintDialogStatus::PrintStatusAmsMappingInvalid);
+            return;
+        }
+    } else {
+        if (!DevMappingUtil::is_valid_mapping_result(obj_, m_ams_mapping_result)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << "print_job: invalid mapping";
+            return;
+        }
     }
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", print_job: for send task, current printer id =  " << QDTCrossTalk::Crosstalk_DevId(m_printer_last_select) << std::endl;
@@ -4285,7 +4316,10 @@ void SelectMachineDialog::on_send_print()
         m_checkbox_list["enable_polar_cooler"]->getValueInt()
     );
 
-    if (obj_->HasAms()) {
+    if (qds_device) {
+        m_print_job->task_use_ams = qds_mapping_validation.uses_box;
+    }
+    else if (obj_->HasAms()) {
         bool has_ext = _HasExt(m_ams_mapping_result);
         bool has_ams = _HasAms(m_ams_mapping_result);
 
@@ -4318,6 +4352,26 @@ void SelectMachineDialog::on_send_print()
     if (agent) {
         std::string dev_ota_str = "dev_ota_ver:" + obj_->get_dev_id();
         agent->track_update_property(dev_ota_str, obj_->get_ota_version());
+    }
+
+    if (qds_device) {
+        const auto latest_box_state = qds_device->getBoxMappingState();
+        const auto latest_validation = latest_box_state.ready
+            ? QDSBoxSync::validate_mapping_result(latest_box_state.snapshot, m_ams_mapping_result)
+            : QDSBoxSync::MappingValidationResult{};
+        const bool snapshot_changed = latest_box_state.ready &&
+                                      latest_box_state.generation != qds_mapping_generation;
+        if (!latest_box_state.ready || snapshot_changed || !latest_validation.valid) {
+            const char *reason = !latest_box_state.ready ? "snapshot unavailable" :
+                                 snapshot_changed ? "snapshot generation changed" :
+                                 latest_validation.reason.c_str();
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": QDS Box mapping changed before send: "
+                                     << reason;
+            Enable_Send_Button(true);
+            show_status(PrintDialogStatus::PrintStatusAmsMappingInvalid);
+            return;
+        }
+        m_print_job->task_use_ams = latest_validation.uses_box;
     }
 
     m_print_job->start();
@@ -4398,45 +4452,25 @@ void SelectMachineDialog::restore_qds_mapping_preferences()
 
         const QDSBoxSync::MappingPreference &saved = preference->second;
         if (!wxGetApp().preset_bundle || mapping.id < 0 ||
-            static_cast<size_t>(mapping.id) >= wxGetApp().preset_bundle->filament_presets.size() ||
-            wxGetApp().preset_bundle->filament_presets[mapping.id] != saved.project_preset) {
+            static_cast<size_t>(mapping.id) >= wxGetApp().preset_bundle->filament_presets.size()) {
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": ignored mapping for a changed project filament "
                                     << mapping.id;
             continue;
         }
 
-        const Preset *project_preset = wxGetApp().preset_bundle->filaments.find_preset(saved.project_preset);
-        const int slot_index = saved.slot_index;
-        const std::string &preset_id = saved.slot_preset_id;
+        const std::string &project_preset_name = wxGetApp().preset_bundle->filament_presets[mapping.id];
+        const Preset *project_preset = wxGetApp().preset_bundle->filaments.find_preset(project_preset_name);
         if (!project_preset ||
-            !QDSBoxSync::mapping_preference_is_current(box_state.snapshot, saved, project_preset->filament_id)) {
+            !QDSBoxSync::apply_mapping_preference(mapping, box_state.snapshot, saved,
+                                                  project_preset_name, project_preset->filament_id)) {
             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": ignored stale QDS mapping for project filament "
-                                       << mapping.id << " slot=" << slot_index;
+                                       << mapping.id << " slot=" << saved.slot_index;
             continue;
         }
 
-        const auto slot = std::find_if(box_state.snapshot.slots.begin(), box_state.snapshot.slots.end(),
-                                       [slot_index](const QDSBoxSync::BoxSlotSnapshot &candidate) {
-                                           return candidate.slot_index == slot_index;
-                                       });
-        if (slot == box_state.snapshot.slots.end())
-            continue;
-
-        mapping.tray_id = slot_index;
-        mapping.ams_id = std::to_string(slot_index / QDSBoxSync::slots_per_box + 1);
-        mapping.slot_id = std::to_string(slot_index);
-        mapping.filament_id = preset_id;
-        mapping.distance = 0.0f;
-        mapping.mapping_result = 0;
-        mapping.ctype = 0;
-        mapping.colors.clear();
-        if (slot->material_type)
-            mapping.type = *slot->material_type;
-        if (slot->colour)
-            mapping.color = slot->colour->substr(1) + "FF";
-
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": restored QDS mapping for project filament "
-                                << mapping.id << " slot=" << slot_index << " preset_id=" << preset_id;
+                                << mapping.id << " slot=" << saved.slot_index
+                                << " preset_id=" << saved.slot_preset_id;
     }
 }
 
@@ -4445,57 +4479,97 @@ void SelectMachineDialog::on_set_finish_mapping(wxCommandEvent &evt)
     auto selection_data = evt.GetString();
     auto selection_data_arr = wxSplit(selection_data.ToStdString(), '|');
 
+    std::optional<QDSBoxSync::BoxSnapshot> qds_snapshot;
+    const auto qds_device = get_current_qds_device();
+    if (qds_device) {
+        const auto box_state = qds_device->getBoxMappingState();
+        if (box_state.ready)
+            qds_snapshot = box_state.snapshot;
+    }
+
     //BOOST_LOG_TRIVIAL(info) << "The box mapping selection result: data is " << selection_data;
 
     if (selection_data_arr.size() == 8) {
-        auto ams_colour      = wxColour(wxAtoi(selection_data_arr[0]), wxAtoi(selection_data_arr[1]), wxAtoi(selection_data_arr[2]), wxAtoi(selection_data_arr[3]));
-        int  old_filament_id = (int) wxAtoi(selection_data_arr[5]);
-        if (m_print_type == PrintFromType::FROM_NORMAL) {//todo:support sd card
-            change_default_normal(old_filament_id, ams_colour);
-            final_deal_edge_pixels_data(m_preview_thumbnail_data);
-            set_default_normal(m_preview_thumbnail_data); // do't reset ams
-        }
-
+        const int project_filament_id = wxAtoi(selection_data_arr[5]);
+        const std::string selected_ams_id = selection_data_arr[6].ToStdString();
+        const std::string selected_slot_id = selection_data_arr[7].ToStdString();
+        MappingItem *selected_item = m_mapping_popup.find_mapping_item(
+            evt.GetInt(), wxAtoi(selection_data_arr[6]), wxAtoi(selection_data_arr[7]));
         int ctype = 0;
         std::vector<wxColour> material_cols;
         std::vector<std::string> tray_cols;
-        for (auto mapping_item : m_mapping_popup.m_mapping_item_list) {
-            if (mapping_item->m_tray_data.id == evt.GetInt()) {
-                ctype = mapping_item->m_tray_data.ctype;
-                material_cols = mapping_item->m_tray_data.material_cols;
-                for (auto col : mapping_item->m_tray_data.material_cols) {
-                    wxString color = wxString::Format("#%02X%02X%02X%02X", col.Red(), col.Green(), col.Blue(), col.Alpha());
-                    tray_cols.push_back(color.ToStdString());
-                }
-                break;
+        if (selected_item) {
+            ctype = selected_item->m_tray_data.ctype;
+            material_cols = selected_item->m_tray_data.material_cols;
+            for (const auto &col : selected_item->m_tray_data.material_cols) {
+                wxString color = wxString::Format("#%02X%02X%02X%02X", col.Red(), col.Green(), col.Blue(), col.Alpha());
+                tray_cols.push_back(color.ToStdString());
             }
         }
 
-        //y69
-        FilamentInfo old_info;
-        FilamentInfo new_info;
-        for (auto i = 0; i < m_ams_mapping_result.size(); i++) {
-            if (m_ams_mapping_result[i].id == wxAtoi(selection_data_arr[5])) {
+        const auto target = std::find_if(m_ams_mapping_result.begin(), m_ams_mapping_result.end(),
+                                         [project_filament_id](const FilamentInfo &mapping) {
+                                             return mapping.id == project_filament_id;
+                                         });
+        if (target == m_ams_mapping_result.end()) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": ignored mapping for a missing project filament";
+            return;
+        }
 
-                old_info = m_ams_mapping_result[i];
+        FilamentInfo old_info = *target;
+        FilamentInfo new_info = old_info;
+        new_info.tray_id = evt.GetInt();
+        const wxColour selected_colour(wxAtoi(selection_data_arr[0]), wxAtoi(selection_data_arr[1]),
+                                       wxAtoi(selection_data_arr[2]), wxAtoi(selection_data_arr[3]));
+        const wxString colour = wxString::Format("#%02X%02X%02X%02X", selected_colour.Red(),
+                                                  selected_colour.Green(), selected_colour.Blue(),
+                                                  selected_colour.Alpha());
+        new_info.color = colour.ToStdString().erase(0, 1);
+        new_info.ctype = ctype;
+        new_info.colors = tray_cols;
+        new_info.ams_id = selected_ams_id;
+        new_info.slot_id = selected_slot_id;
 
-                m_ams_mapping_result[i].tray_id = evt.GetInt();
-                auto ams_colour = wxColour(wxAtoi(selection_data_arr[0]), wxAtoi(selection_data_arr[1]), wxAtoi(selection_data_arr[2]), wxAtoi(selection_data_arr[3]));
-                wxString color = wxString::Format("#%02X%02X%02X%02X", ams_colour.Red(), ams_colour.Green(), ams_colour.Blue(), ams_colour.Alpha());
-                m_ams_mapping_result[i].color = color.ToStdString().erase(0, 1);
-                m_ams_mapping_result[i].ctype = ctype;
-                m_ams_mapping_result[i].colors = tray_cols;
-
-                m_ams_mapping_result[i].ams_id = selection_data_arr[6].ToStdString();
-                m_ams_mapping_result[i].slot_id = selection_data_arr[7].ToStdString();
-
-                if (m_ams_mapping_result[i].ams_id == std::to_string(VIRTUAL_TRAY_MAIN_ID) || m_ams_mapping_result[i].ams_id == std::to_string(VIRTUAL_TRAY_DEPUTY_ID)) {
-                }else if (m_ams_mapping_result[i].ams_id >= std::to_string(0)) {
-                }
-
-                new_info = m_ams_mapping_result[i];
+        if (qds_device) {
+            if (!qds_snapshot || !selected_item || !wxGetApp().preset_bundle || project_filament_id < 0 ||
+                static_cast<size_t>(project_filament_id) >= wxGetApp().preset_bundle->filament_presets.size()) {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": rejected incomplete QDS mapping selection";
+                return;
             }
-            // BOOST_LOG_TRIVIAL(trace) << "The box mapping result: id is " << m_ams_mapping_result[i].id << "tray_id is " << m_ams_mapping_result[i].tray_id;
+            const std::string &project_preset_name = wxGetApp().preset_bundle->filament_presets[project_filament_id];
+            const Preset *project_preset = wxGetApp().preset_bundle->filaments.find_preset(project_preset_name);
+            if (!project_preset) {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": rejected mapping for an unavailable project preset";
+                return;
+            }
+
+            const TrayData &displayed = selected_item->m_tray_data;
+            QDSBoxSync::MappingSelection selection;
+            selection.tray_id = evt.GetInt();
+            selection.ams_id = selected_ams_id;
+            selection.slot_id = selected_slot_id;
+            selection.displayed_preset_id = displayed.filament_preset_id;
+            selection.displayed_material = displayed.filament_type;
+            selection.displayed_colour = wxString::Format("#%02X%02X%02X", displayed.colour.Red(),
+                                                           displayed.colour.Green(), displayed.colour.Blue()).ToStdString();
+            selection.project_preset_id = project_preset->filament_id;
+            selection.project_material = project_preset->config.opt_string("filament_type", 0u);
+            const std::string main_virtual = std::to_string(VIRTUAL_TRAY_MAIN_ID);
+            const std::string deputy_virtual = std::to_string(VIRTUAL_TRAY_DEPUTY_ID);
+            selection.enforce_material = selected_ams_id != main_virtual &&
+                                         selected_ams_id != deputy_virtual;
+            if (!QDSBoxSync::apply_mapping_selection(new_info, *qds_snapshot, selection)) {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+                                           << ": rejected stale or incompatible QDS mapping selection";
+                return;
+            }
+        }
+
+        *target = new_info;
+        if (m_print_type == PrintFromType::FROM_NORMAL) {//todo:support sd card
+            change_default_normal(project_filament_id, DevAmsTray::decode_color(new_info.color));
+            final_deal_edge_pixels_data(m_preview_thumbnail_data);
+            set_default_normal(m_preview_thumbnail_data); // do't reset ams
         }
 
         for (auto i = 0; i < m_ams_mapping_result.size(); i++) {
@@ -7061,7 +7135,9 @@ bool SelectMachineDialog::Show(bool show)
             }
         };
     } else {
-        m_refresh_timer->Stop();
+        if (m_refresh_timer)
+            m_refresh_timer->Stop();
+        dismiss_transient_popups();
         return DPIDialog::Show(false);
     }
 
@@ -7094,7 +7170,39 @@ bool SelectMachineDialog::Show(bool show)
 
 SelectMachineDialog::~SelectMachineDialog()
 {
-    delete m_refresh_timer;
+    dismiss_transient_popups();
+    if (m_refresh_timer) {
+        m_refresh_timer->Stop();
+        delete m_refresh_timer;
+        m_refresh_timer = nullptr;
+    }
+}
+
+void SelectMachineDialog::dismiss_transient_popups()
+{
+    dismiss_transient_popup(&m_mapping_popup);
+    dismiss_transient_popup(&m_mapping_tip_popup);
+    dismiss_transient_popup(&m_mapping_tutorial_popup);
+    destroy_timelapse_storage_popup();
+}
+
+void SelectMachineDialog::destroy_timelapse_storage_popup()
+{
+    PopupWindow *popup = m_timelapse_storage_popup;
+    if (!popup)
+        return;
+
+    popup->Unbind(wxEVT_SHOW, &SelectMachineDialog::on_timelapse_storage_popup_show, this);
+    destroy_transient_popup(m_timelapse_storage_popup);
+}
+
+void SelectMachineDialog::on_timelapse_storage_popup_show(wxShowEvent &event)
+{
+    if (!event.IsShown()) {
+        update_timelapse_folder_btn_icon();
+        destroy_timelapse_storage_popup();
+    }
+    event.Skip();
 }
 
 void SelectMachineDialog::UpdateStatusCheckWarning_ExtensionTool(MachineObject* obj_)

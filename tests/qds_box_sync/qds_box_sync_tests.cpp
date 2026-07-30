@@ -1,6 +1,7 @@
 #include <catch_main.hpp>
 
 #include "slic3r/GUI/DeviceCore/QDSBoxSync.hpp"
+#include "libslic3r/ProjectTask.hpp"
 
 using namespace Slic3r::GUI::QDSBoxSync;
 
@@ -33,6 +34,28 @@ BoxSnapshot live_snapshot(std::optional<int> loaded_slot = std::nullopt)
         qidi_basic(3, "#FAFAFA")
     };
     return normalize_snapshot(input);
+}
+
+MappingSelection qidi_selection(int tray_id, const std::string &colour)
+{
+    MappingSelection selection;
+    selection.tray_id = tray_id;
+    selection.ams_id = std::to_string(tray_id / slots_per_box + 1);
+    selection.slot_id = std::to_string(tray_id);
+    selection.displayed_preset_id = "QD_0_1_7";
+    selection.displayed_material = "PLA";
+    selection.displayed_colour = colour;
+    selection.project_preset_id = "QD_0_1_7";
+    selection.project_material = "PLA";
+    return selection;
+}
+
+MappingSelection external_selection(const std::string &colour)
+{
+    auto selection = qidi_selection(0, colour);
+    selection.ams_id = "255";
+    selection.slot_id = "255";
+    return selection;
 }
 
 } // namespace
@@ -413,6 +436,189 @@ TEST_CASE("stale persisted mapping is rejected", "[qds_box_sync][mapping]")
     REQUIRE_FALSE(mapping_preference_is_current(snapshot, preference, "QD_0_1_6"));
 }
 
+TEST_CASE("persisted mapping restoration has one deterministic representation",
+          "[qds_box_sync][mapping][persistence]")
+{
+    auto snapshot = live_snapshot();
+    MappingPreference preference{0, "QIDI PLA Basic @Qidi X-Plus 4 0.4 nozzle", 3, "QD_0_1_7"};
+    Slic3r::FilamentInfo mapping;
+    mapping.id = 0;
+    mapping.color = "228332FF";
+    mapping.colors = {"112233FF"};
+    mapping.ctype = 2;
+
+    REQUIRE(apply_mapping_preference(mapping, snapshot, preference,
+                                     preference.project_preset, "QD_0_1_7"));
+    REQUIRE(mapping.tray_id == 3);
+    REQUIRE(mapping.ams_id == "1");
+    REQUIRE(mapping.slot_id == "3");
+    REQUIRE(mapping.filament_id == "QD_0_1_7");
+    REQUIRE(mapping.type == "PLA");
+    REQUIRE(mapping.color == "FAFAFAFF");
+    REQUIRE(mapping.distance == 0.0f);
+    REQUIRE(mapping.mapping_result == Slic3r::MAPPING_RESULT_DEFAULT);
+    REQUIRE(mapping.ctype == 0);
+    REQUIRE(mapping.colors.empty());
+
+    REQUIRE_FALSE(apply_mapping_preference(mapping, snapshot, preference,
+                                            "changed project preset", "QD_0_1_7"));
+    REQUIRE_FALSE(apply_mapping_preference(mapping, snapshot, preference,
+                                            preference.project_preset, "QD_0_1_6"));
+
+    BoxSnapshotInput missing_colour;
+    missing_colour.box_count = 1;
+    missing_colour.box_id = "0";
+    RawSlot slot = qidi_basic(0, "#228332");
+    slot.colour.reset();
+    missing_colour.slots.push_back(slot);
+    auto neutral_snapshot = normalize_snapshot(missing_colour);
+    preference.slot_index = 0;
+    REQUIRE(apply_mapping_preference(mapping, neutral_snapshot, preference,
+                                     preference.project_preset, "QD_0_1_7"));
+    REQUIRE(mapping.color == "CECECEFF");
+}
+
+TEST_CASE("final send validation accepts every current Box slot and reports Box use",
+          "[qds_box_sync][mapping][send]")
+{
+    const auto snapshot = live_snapshot();
+    for (int slot = 0; slot < 4; ++slot) {
+        Slic3r::FilamentInfo mapping;
+        mapping.id          = 0;
+        mapping.tray_id     = slot;
+        mapping.ams_id      = "1";
+        mapping.slot_id     = std::to_string(slot);
+        mapping.filament_id = "QD_0_1_7";
+        mapping.type        = "PLA";
+        mapping.color       = std::array<std::string, 4>{"228332FF", "FF362DFF", "DFD628FF", "FAFAFAFF"}[slot];
+
+        const auto validation = validate_mapping_result(snapshot, {mapping});
+        REQUIRE(validation.valid);
+        REQUIRE(validation.uses_box);
+    }
+}
+
+TEST_CASE("final send validation rejects unmapped, stale, and inconsistent QDS mappings",
+          "[qds_box_sync][mapping][send]")
+{
+    const auto snapshot = live_snapshot();
+    Slic3r::FilamentInfo mapping;
+    mapping.id = 0;
+    REQUIRE_FALSE(validate_mapping_result(snapshot, {mapping}).valid);
+    REQUIRE_FALSE(validate_mapping_result(snapshot, {}).valid);
+
+    mapping.tray_id     = 3;
+    mapping.ams_id      = "1";
+    mapping.slot_id     = "3";
+    mapping.filament_id = "QD_0_1_6";
+    mapping.type        = "PLA";
+    mapping.color       = "FAFAFAFF";
+    REQUIRE_FALSE(validate_mapping_result(snapshot, {mapping}).valid);
+
+    mapping.filament_id = "QD_0_1_7";
+    mapping.ams_id      = "2";
+    REQUIRE_FALSE(validate_mapping_result(snapshot, {mapping}).valid);
+    mapping.ams_id  = "1";
+    mapping.slot_id = "2";
+    REQUIRE_FALSE(validate_mapping_result(snapshot, {mapping}).valid);
+}
+
+TEST_CASE("final send validation accepts only the current optional external spool",
+          "[qds_box_sync][mapping][send][external]")
+{
+    BoxSnapshotInput input;
+    input.box_count = 1;
+    input.box_id = "0";
+    input.slots = {qidi_basic(0, "#228332")};
+    RawSlot external = qidi_basic(16, "#FAFAFA");
+    input.external_spool = external;
+    const auto snapshot = normalize_snapshot(input);
+    REQUIRE(snapshot.external_spool.has_value());
+
+    Slic3r::FilamentInfo mapping;
+    mapping.id          = 0;
+    mapping.filament_id = "project-preset-before-selection";
+    REQUIRE(apply_mapping_selection(mapping, snapshot, external_selection("#FAFAFA")));
+    REQUIRE(mapping.tray_id == 255);
+    REQUIRE(mapping.ams_id == "255");
+    REQUIRE(mapping.slot_id == "255");
+    REQUIRE(mapping.filament_id == "QD_0_1_7");
+    REQUIRE(mapping.type == "PLA");
+    REQUIRE(mapping.color == "FAFAFAFF");
+    const auto validation = validate_mapping_result(snapshot, {mapping});
+    REQUIRE(validation.valid);
+    REQUIRE_FALSE(validation.uses_box);
+
+    mapping.filament_id = "QD_0_1_6";
+    REQUIRE_FALSE(validate_mapping_result(snapshot, {mapping}).valid);
+    REQUIRE_FALSE(validate_mapping_result(live_snapshot(), {mapping}).valid);
+
+    mapping.tray_id     = -1;
+    mapping.ams_id.clear();
+    mapping.slot_id     = "16";
+    mapping.filament_id = "QD_0_1_7";
+    mapping.type        = "PLA";
+    mapping.color       = "FAFAFAFF";
+    REQUIRE(validate_mapping_result(snapshot, {mapping}).valid);
+}
+
+TEST_CASE("manual Box selection refreshes exact physical preset and material identity",
+          "[qds_box_sync][mapping][selection]")
+{
+    const auto snapshot = live_snapshot();
+    Slic3r::FilamentInfo mapping;
+    mapping.id          = 0;
+    mapping.filament_id = "generic-project-preset";
+    mapping.type        = "generic-pla";
+    mapping.color       = "000000FF";
+
+    REQUIRE(apply_mapping_selection(mapping, snapshot, qidi_selection(3, "#FAFAFA")));
+    REQUIRE(mapping.tray_id == 3);
+    REQUIRE(mapping.ams_id == "1");
+    REQUIRE(mapping.slot_id == "3");
+    REQUIRE(mapping.filament_id == "QD_0_1_7");
+    REQUIRE(mapping.type == "PLA");
+    REQUIRE(mapping.color == "FAFAFAFF");
+    REQUIRE(validate_mapping_result(snapshot, {mapping}).valid);
+
+    const auto accepted_mapping = mapping;
+    auto wrong_ams = qidi_selection(3, "#FAFAFA");
+    wrong_ams.ams_id = "2";
+    REQUIRE_FALSE(apply_mapping_selection(mapping, snapshot, wrong_ams));
+    REQUIRE(mapping.filament_id == accepted_mapping.filament_id);
+    REQUIRE(mapping.slot_id == accepted_mapping.slot_id);
+
+    auto wrong_slot = qidi_selection(3, "#FAFAFA");
+    wrong_slot.slot_id = "2";
+    REQUIRE_FALSE(apply_mapping_selection(mapping, snapshot, wrong_slot));
+    REQUIRE_FALSE(apply_mapping_selection(mapping, live_snapshot(), external_selection("#FAFAFA")));
+
+    auto stale_preset = qidi_selection(3, "#FAFAFA");
+    stale_preset.displayed_preset_id = "QD_0_1_6";
+    REQUIRE_FALSE(apply_mapping_selection(mapping, snapshot, stale_preset));
+
+    auto stale_colour = qidi_selection(3, "#228332");
+    REQUIRE_FALSE(apply_mapping_selection(mapping, snapshot, stale_colour));
+
+    auto incompatible_project = qidi_selection(3, "#FAFAFA");
+    incompatible_project.project_material = "PETG";
+    REQUIRE_FALSE(apply_mapping_selection(mapping, snapshot, incompatible_project));
+}
+
+TEST_CASE("same-preset colour changes invalidate a serialized mapping", "[qds_box_sync][mapping][send][colour]")
+{
+    Slic3r::FilamentInfo mapping;
+    mapping.id = 0;
+    REQUIRE(apply_mapping_selection(mapping, live_snapshot(), qidi_selection(0, "#228332")));
+    REQUIRE(validate_mapping_result(live_snapshot(), {mapping}).valid);
+
+    BoxSnapshotInput changed;
+    changed.box_count = 1;
+    changed.box_id = "0";
+    changed.slots = {qidi_basic(0, "#FF362D")};
+    REQUIRE_FALSE(validate_mapping_result(normalize_snapshot(changed), {mapping}).valid);
+}
+
 TEST_CASE("exact QIDI identity is required before colour chooses among equivalent slots", "[qds_box_sync][mapping]")
 {
     REQUIRE(qidi_filament_ids_compatible("QD_0_1_7", "QD_0_1_7"));
@@ -448,6 +654,32 @@ TEST_CASE("mapping preferences are scoped to printer, device, and project preset
     REQUIRE(deserialize_mapping_preferences(stored, {"X-Plus 4 0.4 nozzle", "printer-b"}).empty());
 }
 
+TEST_CASE("external-spool mapping preferences persist and restore canonically",
+          "[qds_box_sync][mapping][persistence][external]")
+{
+    BoxSnapshotInput input;
+    input.box_count = 1;
+    input.box_id = "0";
+    input.slots = {qidi_basic(0, "#228332")};
+    input.external_spool = qidi_basic(external_spool_slot, "#FAFAFA");
+    const auto snapshot = normalize_snapshot(input);
+
+    const MappingContext context{"X-Plus 4 0.4 nozzle", "printer-a"};
+    MappingPreferences preferences;
+    preferences.emplace(0, MappingPreference{0, "QIDI PLA Basic", external_spool_slot, "QD_0_1_7"});
+    const auto restored = deserialize_mapping_preferences(serialize_mapping_preferences(context, preferences), context);
+    REQUIRE(restored.size() == 1);
+    REQUIRE(restored.at(0).slot_index == external_spool_slot);
+
+    Slic3r::FilamentInfo mapping;
+    mapping.id = 0;
+    REQUIRE(apply_mapping_preference(mapping, snapshot, restored.at(0), "QIDI PLA Basic", "QD_0_1_7"));
+    REQUIRE(mapping.tray_id == 255);
+    REQUIRE(mapping.ams_id == "255");
+    REQUIRE(mapping.slot_id == "255");
+    REQUIRE_FALSE(validate_mapping_result(snapshot, {mapping}).uses_box);
+}
+
 TEST_CASE("local mapping identity survives regenerated runtime ids", "[qds_box_sync][mapping][persistence]")
 {
     REQUIRE(mapping_device_identity(" 192.0.2.1 ", "1234") == "192.0.2.1");
@@ -471,4 +703,55 @@ TEST_CASE("empty mappings clear safely and legacy or malformed data is ignored",
     diagnostics.clear();
     REQUIRE(deserialize_mapping_preferences("not-json", context, &diagnostics).empty());
     REQUIRE_FALSE(diagnostics.empty());
+}
+
+TEST_CASE("mapping confirmation rejects unavailable or changed snapshot generations",
+          "[qds_box_sync][mapping][generation]")
+{
+    REQUIRE(mapping_generation_is_current(true, 7, 7));
+    REQUIRE_FALSE(mapping_generation_is_current(false, 7, 7));
+    REQUIRE_FALSE(mapping_generation_is_current(true, 0, 0));
+    REQUIRE_FALSE(mapping_generation_is_current(true, 7, 8));
+}
+
+TEST_CASE("empty-project direct synchronization captures the current QDS generation",
+          "[qds_box_sync][mapping][generation][direct]")
+{
+    const auto ready = prepare_direct_sync(true, true, 11);
+    REQUIRE(ready.can_skip_dialog);
+    REQUIRE(ready.generation == 11);
+    REQUIRE(mapping_generation_is_current(true, ready.generation, 11));
+
+    REQUIRE_FALSE(prepare_direct_sync(false, true, 11).can_skip_dialog);
+    REQUIRE_FALSE(prepare_direct_sync(true, false, 11).can_skip_dialog);
+    REQUIRE_FALSE(prepare_direct_sync(true, true, 0).can_skip_dialog);
+}
+
+TEST_CASE("external-spool material policy does not weaken exact QIDI identity",
+          "[qds_box_sync][mapping][external]")
+{
+    BoxSnapshotInput input;
+    input.box_count = 1;
+    input.box_id = "0";
+    input.slots = {qidi_basic(0, "#228332")};
+    input.external_spool = qidi_basic(external_spool_slot, "#FAFAFA");
+    const auto snapshot = normalize_snapshot(input);
+
+    Slic3r::FilamentInfo mapping;
+    mapping.id = 0;
+    auto relaxed = external_selection("#FAFAFA");
+    relaxed.project_preset_id.clear();
+    relaxed.project_material = "PETG";
+    relaxed.enforce_material = false;
+    REQUIRE(apply_mapping_selection(mapping, snapshot, relaxed));
+    REQUIRE(mapping.tray_id == 255);
+    REQUIRE(mapping.type == "PLA");
+
+    auto strict = relaxed;
+    strict.enforce_material = true;
+    REQUIRE_FALSE(apply_mapping_selection(mapping, snapshot, strict));
+
+    auto wrong_qidi_identity = relaxed;
+    wrong_qidi_identity.project_preset_id = "QD_0_1_6";
+    REQUIRE_FALSE(apply_mapping_selection(mapping, snapshot, wrong_qidi_identity));
 }

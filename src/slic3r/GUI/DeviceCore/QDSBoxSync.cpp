@@ -7,6 +7,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include "libslic3r/ProjectTask.hpp"
+#include "DevDefs.h"
+
 namespace Slic3r::GUI::QDSBoxSync {
 
 namespace {
@@ -30,6 +33,48 @@ BoxSlotSnapshot normalize_slot(const RawSlot &raw, const std::string &box_id)
     if (raw.remaining_percent && *raw.remaining_percent >= 0 && *raw.remaining_percent <= 100)
         slot.remaining_percent = raw.remaining_percent;
     return slot;
+}
+
+void assign_mapping_target(FilamentInfo &mapping, const BoxSlotSnapshot &slot,
+                           std::optional<int> external_virtual_id = std::nullopt)
+{
+    if (external_virtual_id) {
+        mapping.tray_id = *external_virtual_id;
+        mapping.ams_id  = std::to_string(*external_virtual_id);
+        mapping.slot_id = std::to_string(*external_virtual_id);
+    } else {
+        mapping.tray_id = slot.slot_index;
+        mapping.ams_id  = std::to_string(slot.slot_index / slots_per_box + 1);
+        mapping.slot_id = std::to_string(slot.slot_index);
+    }
+    mapping.filament_id    = *slot.filament_preset_id;
+    mapping.type           = slot.material_type.value_or("");
+    mapping.color          = slot.colour.value_or("#CECECE").substr(1) + "FF";
+    mapping.distance       = 0.0f;
+    mapping.mapping_result = MAPPING_RESULT_DEFAULT;
+    mapping.ctype          = 0;
+    mapping.colors.clear();
+}
+
+const BoxSlotSnapshot *find_snapshot_slot(const BoxSnapshot &snapshot, int slot_index)
+{
+    if (slot_index == external_spool_slot)
+        return snapshot.external_spool ? &*snapshot.external_spool : nullptr;
+
+    const auto slot = std::find_if(snapshot.slots.begin(), snapshot.slots.end(),
+                                   [slot_index](const BoxSlotSnapshot &candidate) {
+                                       return candidate.slot_index == slot_index;
+                                   });
+    return slot == snapshot.slots.end() ? nullptr : &*slot;
+}
+
+bool mapping_target_matches(const FilamentInfo &mapping, const BoxSlotSnapshot &slot)
+{
+    if (!slot.filament_preset_id || mapping.filament_id != *slot.filament_preset_id)
+        return false;
+
+    const std::string expected_colour = slot.colour.value_or("#CECECE").substr(1) + "FF";
+    return mapping.type == slot.material_type.value_or("") && mapping.color == expected_colour;
 }
 
 } // namespace
@@ -341,11 +386,21 @@ BoxSnapshotInput merge_snapshot_patch(BoxSnapshotInput input, const BoxSnapshotP
     return input;
 }
 
+DirectSyncState prepare_direct_sync(bool snapshot_ready, bool profile_compatible, std::uint64_t generation)
+{
+    const bool can_skip_dialog = snapshot_ready && profile_compatible && generation != 0;
+    return {can_skip_dialog, can_skip_dialog ? generation : 0};
+}
+
+bool mapping_generation_is_current(bool ready, std::uint64_t expected_generation, std::uint64_t current_generation)
+{
+    return ready && expected_generation != 0 && expected_generation == current_generation;
+}
+
 bool mapping_is_current(const BoxSnapshot &snapshot, int slot_index, const std::string &filament_preset_id)
 {
-    const auto iter = std::find_if(snapshot.slots.begin(), snapshot.slots.end(),
-                                   [slot_index](const BoxSlotSnapshot &slot) { return slot.slot_index == slot_index; });
-    return iter != snapshot.slots.end() && iter->filament_preset_id && *iter->filament_preset_id == filament_preset_id;
+    const BoxSlotSnapshot *slot = find_snapshot_slot(snapshot, slot_index);
+    return slot && slot->filament_preset_id && *slot->filament_preset_id == filament_preset_id;
 }
 
 bool mapping_preference_is_current(const BoxSnapshot &snapshot,
@@ -354,6 +409,108 @@ bool mapping_preference_is_current(const BoxSnapshot &snapshot,
 {
     return mapping_is_current(snapshot, preference.slot_index, preference.slot_preset_id) &&
            qidi_filament_ids_compatible(project_preset_id, preference.slot_preset_id);
+}
+
+bool apply_mapping_preference(FilamentInfo &mapping,
+                              const BoxSnapshot &snapshot,
+                              const MappingPreference &preference,
+                              const std::string &project_preset_name,
+                              const std::string &project_preset_id)
+{
+    if (mapping.id != preference.project_filament ||
+        project_preset_name != preference.project_preset ||
+        !mapping_preference_is_current(snapshot, preference, project_preset_id))
+        return false;
+
+    const BoxSlotSnapshot *slot = find_snapshot_slot(snapshot, preference.slot_index);
+    if (!slot)
+        return false;
+
+    if (preference.slot_index == external_spool_slot)
+        assign_mapping_target(mapping, *slot, VIRTUAL_TRAY_MAIN_ID);
+    else
+        assign_mapping_target(mapping, *slot);
+    return true;
+}
+
+bool apply_mapping_selection(FilamentInfo &mapping,
+                             const BoxSnapshot &snapshot,
+                             const MappingSelection &selection)
+{
+    const std::string main_virtual = std::to_string(VIRTUAL_TRAY_MAIN_ID);
+    const std::string deputy_virtual = std::to_string(VIRTUAL_TRAY_DEPUTY_ID);
+    const bool external = (selection.ams_id == main_virtual || selection.ams_id == deputy_virtual) &&
+                          selection.slot_id == selection.ams_id;
+    const BoxSlotSnapshot *slot = external
+        ? find_snapshot_slot(snapshot, external_spool_slot)
+        : find_snapshot_slot(snapshot, selection.tray_id);
+    if (!slot || !slot->filament_preset_id ||
+        selection.displayed_preset_id != *slot->filament_preset_id ||
+        selection.displayed_material != slot->material_type.value_or("") ||
+        selection.displayed_colour != slot->colour.value_or("#CECECE") ||
+        !filament_selection_compatible(selection.project_material,
+                                       selection.project_preset_id,
+                                       slot->material_type.value_or(""),
+                                       *slot->filament_preset_id,
+                                       selection.enforce_material))
+        return false;
+
+    if (external) {
+        const int virtual_id = selection.ams_id == main_virtual
+            ? VIRTUAL_TRAY_MAIN_ID : VIRTUAL_TRAY_DEPUTY_ID;
+        assign_mapping_target(mapping, *slot, virtual_id);
+        return true;
+    }
+
+    if (selection.ams_id != std::to_string(selection.tray_id / slots_per_box + 1) ||
+        selection.slot_id != std::to_string(selection.tray_id))
+            return false;
+
+    assign_mapping_target(mapping, *slot);
+    return true;
+}
+
+MappingValidationResult validate_mapping_result(const BoxSnapshot &snapshot,
+                                                const std::vector<FilamentInfo> &mappings)
+{
+    MappingValidationResult result;
+    if (mappings.empty()) {
+        result.reason = "mapping list is empty";
+        return result;
+    }
+
+    for (const FilamentInfo &mapping : mappings) {
+        const bool canonical_external =
+            ((mapping.ams_id == std::to_string(VIRTUAL_TRAY_MAIN_ID) &&
+              mapping.tray_id == VIRTUAL_TRAY_MAIN_ID) ||
+             (mapping.ams_id == std::to_string(VIRTUAL_TRAY_DEPUTY_ID) &&
+              mapping.tray_id == VIRTUAL_TRAY_DEPUTY_ID)) &&
+            mapping.slot_id == mapping.ams_id;
+        const bool legacy_external = mapping.tray_id < 0 && mapping.ams_id.empty() &&
+            snapshot.external_spool &&
+            mapping.slot_id == std::to_string(snapshot.external_spool->slot_index);
+        if (canonical_external || legacy_external) {
+            if (!snapshot.external_spool ||
+                !mapping_target_matches(mapping, *snapshot.external_spool)) {
+                result.reason = "project filament is not mapped to the current external spool";
+                return result;
+            }
+            continue;
+        }
+
+        const std::string expected_ams = std::to_string(mapping.tray_id / slots_per_box + 1);
+        const BoxSlotSnapshot *slot = find_snapshot_slot(snapshot, mapping.tray_id);
+        if (mapping.slot_id != std::to_string(mapping.tray_id) || mapping.ams_id != expected_ams || !slot ||
+            !mapping_target_matches(mapping, *slot)) {
+            result.reason = "project filament is not mapped to a current occupied Box slot";
+            return result;
+        }
+        result.uses_box = true;
+    }
+
+    result.valid = true;
+    result.reason = "all project filaments map to the current QDS snapshot";
+    return result;
 }
 
 std::string serialize_mapping_preferences(const MappingContext &context, const MappingPreferences &preferences)
@@ -420,7 +577,7 @@ MappingPreferences deserialize_mapping_preferences(const std::string &stored,
             preference.slot_index       = entry["slot"].get<int>();
             preference.slot_preset_id   = entry["preset_id"].get<std::string>();
             if (preference.project_filament < 0 || preference.project_preset.empty() ||
-                preference.slot_index < 0 || preference.slot_index >= max_box_slots || preference.slot_preset_id.empty()) {
+                preference.slot_index < 0 || preference.slot_index > external_spool_slot || preference.slot_preset_id.empty()) {
                 diagnose("ignored invalid QDS mapping entry");
                 continue;
             }

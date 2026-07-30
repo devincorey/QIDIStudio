@@ -2,17 +2,21 @@
 #define slic3r_GUI_DeviceCore_QDSBoxSync_hpp_
 
 #include <array>
+#include <cstdint>
 #include <cstddef>
 #include <map>
 #include <optional>
 #include <string>
 #include <vector>
 
+namespace Slic3r { struct FilamentInfo; }
+
 namespace Slic3r::GUI::QDSBoxSync {
 
 constexpr int slots_per_box = 4;
 constexpr int max_box_count = 4;
 constexpr int max_box_slots = slots_per_box * max_box_count;
+constexpr int external_spool_slot = max_box_slots;
 
 struct PrinterMetadata
 {
@@ -116,6 +120,32 @@ struct MappingPreference
     std::string slot_preset_id;
 };
 
+struct MappingValidationResult
+{
+    bool        valid{false};
+    bool        uses_box{false};
+    std::string reason;
+};
+
+struct MappingSelection
+{
+    int         tray_id{-1};
+    std::string ams_id;
+    std::string slot_id;
+    std::string displayed_preset_id;
+    std::string displayed_material;
+    std::string displayed_colour;
+    std::string project_preset_id;
+    std::string project_material;
+    bool        enforce_material{true};
+};
+
+struct DirectSyncState
+{
+    bool          can_skip_dialog{false};
+    std::uint64_t generation{0};
+};
+
 using MappingPreferences = std::map<int, MappingPreference>;
 
 std::string normalize_model_name(const std::string &model);
@@ -143,10 +173,22 @@ bool snapshot_ready_for_sync(const BoxSnapshotInput &input,
                              bool box_count_seen,
                              const std::array<bool, max_box_slots> &occupancy_seen);
 BoxSnapshotInput merge_snapshot_patch(BoxSnapshotInput input, const BoxSnapshotPatch &patch);
+DirectSyncState prepare_direct_sync(bool snapshot_ready, bool profile_compatible, std::uint64_t generation);
+bool mapping_generation_is_current(bool ready, std::uint64_t expected_generation, std::uint64_t current_generation);
 bool mapping_is_current(const BoxSnapshot &snapshot, int slot_index, const std::string &filament_preset_id);
 bool mapping_preference_is_current(const BoxSnapshot &snapshot,
                                    const MappingPreference &preference,
                                    const std::string &project_preset_id);
+bool apply_mapping_preference(FilamentInfo &mapping,
+                              const BoxSnapshot &snapshot,
+                              const MappingPreference &preference,
+                              const std::string &project_preset_name,
+                              const std::string &project_preset_id);
+bool apply_mapping_selection(FilamentInfo &mapping,
+                             const BoxSnapshot &snapshot,
+                             const MappingSelection &selection);
+MappingValidationResult validate_mapping_result(const BoxSnapshot &snapshot,
+                                                const std::vector<FilamentInfo> &mappings);
 std::string serialize_mapping_preferences(const MappingContext &context, const MappingPreferences &preferences);
 MappingPreferences deserialize_mapping_preferences(const std::string &stored,
                                                     const MappingContext &context,

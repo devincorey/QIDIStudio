@@ -281,7 +281,7 @@ class AmsMapingPopup : public PopupWindow
 
 public:
     AmsMapingPopup(wxWindow *parent,bool use_in_sync_dialog = false);
-    ~AmsMapingPopup() {};
+    ~AmsMapingPopup() override;
 
     MaterialItem* m_parent_item{ nullptr };
 
@@ -290,6 +290,8 @@ public:
     std::vector<wxBoxSizer*> m_amsmapping_container_sizer_list;
     std::vector<MappingContainer*> m_amsmapping_container_list;
     std::vector<MappingItem*> m_mapping_item_list;
+
+    MappingItem* find_mapping_item(int tray_id, int ams_id, int slot_id) const;
 
     bool        m_has_unmatch_filament {false};
     bool        m_has_external_spool{false};
@@ -354,6 +356,7 @@ public:
     bool         is_match_material(std::string material) const;
     bool         is_match_filament(const TrayData &tray_data, bool enforce_material = true) const;
     void         on_left_down(wxMouseEvent &evt);
+    void         Dismiss() wxOVERRIDE;
     virtual void OnDismiss() wxOVERRIDE;
     virtual bool ProcessLeftDown(wxMouseEvent &event) wxOVERRIDE;
     void         paintEvent(wxPaintEvent &evt);
@@ -388,6 +391,9 @@ private:
     // events
     void OnNozzleMappingSelected(wxCommandEvent& evt);
     void update_flush_waste(MachineObject* obj);
+#ifdef __APPLE__
+    void destroy_tip_popup();
+#endif
 
 private:
     std::weak_ptr<DevNozzleRack> m_rack;

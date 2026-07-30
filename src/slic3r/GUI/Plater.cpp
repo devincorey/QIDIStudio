@@ -5173,7 +5173,7 @@ std::map<int, DynamicPrintConfig> Sidebar::build_filament_box_list(std::vector<s
     }
 
     // External spool is optional; an empty firmware placeholder is not a filament.
-    constexpr size_t external_index = 16;
+    const size_t external_index = static_cast<size_t>(QDSBoxSync::external_spool_slot);
     if (aligned_size > external_index && slot_state[external_index] != 0 &&
         slot_id[external_index] >= 0 && !id[external_index].empty()) {
         const std::string safe_colour = QDSBoxSync::normalize_colour(color[external_index]).value_or("#CECECE");
@@ -5283,6 +5283,28 @@ void Sidebar::sync_box_list(bool is_from_big_sync_btn)
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "check error: sync_result.is_same_printer value is false";
         return;
     }
+    if (obj) {
+        const auto box_state = obj->getBoxMappingState();
+        const bool generation_is_current = QDSBoxSync::mapping_generation_is_current(
+            box_state.ready, sync_result.qds_snapshot_generation, box_state.generation);
+        const auto validation = generation_is_current && !sync_result.direct_sync
+            ? QDSBoxSync::validate_mapping_result(box_state.snapshot,
+                                                  m_sync_box_dlg->get_ams_mapping_result())
+            : QDSBoxSync::MappingValidationResult{};
+        if (!generation_is_current || (!sync_result.direct_sync && !validation.valid)) {
+            const std::string reason = !generation_is_current
+                ? "snapshot generation changed"
+                : validation.reason;
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+                                       << ": canceled stale QDS Box synchronization before project mutation: "
+                                       << reason;
+            MessageDialog dlg(this,
+                _L("Box filament information changed. Please synchronize again."),
+                _L("Sync filaments with BOX"), wxOK);
+            dlg.ShowModal();
+            return;
+        }
+    }
     list2.resize(list.size());
     auto iter = list.begin();
     for (int i = 0; i < list.size(); ++i, ++iter) {
@@ -5327,15 +5349,26 @@ void Sidebar::sync_box_list(bool is_from_big_sync_btn)
         } else {
             for (const auto &[project_filament, mapping] : sync_result.sync_maps) {
                 try {
-                    size_t parsed = 0;
-                    const int slot_index = std::stoi(mapping.slot_id, &parsed);
-                    if (parsed != mapping.slot_id.size() || slot_index < 0 || slot_index >= QDSBoxSync::max_box_slots)
-                        throw std::invalid_argument("invalid Box slot identifier");
-                    const auto slot = std::find_if(box_state.snapshot.slots.begin(), box_state.snapshot.slots.end(),
-                                                   [slot_index](const QDSBoxSync::BoxSlotSnapshot &snapshot_slot) {
-                                                       return snapshot_slot.slot_index == slot_index;
-                                                   });
-                    if (slot != box_state.snapshot.slots.end() && slot->filament_preset_id && project_filament >= 0 &&
+                    const bool external = mapping.ams_id == std::to_string(VIRTUAL_TRAY_MAIN_ID) &&
+                                          mapping.slot_id == std::to_string(VIRTUAL_TRAY_MAIN_ID);
+                    int slot_index = QDSBoxSync::external_spool_slot;
+                    const QDSBoxSync::BoxSlotSnapshot *slot = nullptr;
+                    if (external) {
+                        if (box_state.snapshot.external_spool)
+                            slot = &*box_state.snapshot.external_spool;
+                    } else {
+                        size_t parsed = 0;
+                        slot_index = std::stoi(mapping.slot_id, &parsed);
+                        if (parsed != mapping.slot_id.size() || slot_index < 0 || slot_index >= QDSBoxSync::max_box_slots)
+                            throw std::invalid_argument("invalid Box slot identifier");
+                        const auto found = std::find_if(box_state.snapshot.slots.begin(), box_state.snapshot.slots.end(),
+                                                        [slot_index](const QDSBoxSync::BoxSlotSnapshot &snapshot_slot) {
+                                                            return snapshot_slot.slot_index == slot_index;
+                                                        });
+                        if (found != box_state.snapshot.slots.end())
+                            slot = &*found;
+                    }
+                    if (slot && slot->filament_preset_id && project_filament >= 0 &&
                         static_cast<size_t>(project_filament) < wxGetApp().preset_bundle->filament_presets.size()) {
                         stored_mappings.emplace(project_filament, QDSBoxSync::MappingPreference{
                             project_filament,

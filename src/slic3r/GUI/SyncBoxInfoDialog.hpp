@@ -61,8 +61,8 @@ class SyncBoxInfoDialog : public DPIDialog
 
     std::vector<POItem> ops_auto;
     std::vector<POItem> ops_no_auto;
-    MachineObject* obj_{nullptr};
     std::weak_ptr<QDSDevice> m_qds_device;
+    std::uint64_t m_qds_mapping_generation{0};
     QDSBoxSync::MappingPreferences m_persisted_mappings;
     QDSModalCloseCoordinator m_modal_close;
 
@@ -243,11 +243,17 @@ public:
         bool direct_sync = true;
         bool is_same_printer = true;
         std::map<int, AMSMapInfo> sync_maps;
+        std::uint64_t qds_snapshot_generation{0};
     };
     SyncBoxInfoDialog(wxWindow *parent, SyncInfo &info);
     ~SyncBoxInfoDialog();
     void set_info(SyncInfo &info);
-    void set_qds_device(const std::shared_ptr<QDSDevice> &device) { m_qds_device = device; }
+    void set_qds_device(const std::shared_ptr<QDSDevice> &device)
+    {
+        m_qds_device = device;
+        m_qds_mapping_generation = 0;
+        m_result.qds_snapshot_generation = 0;
+    }
     void set_persisted_mappings(const QDSBoxSync::MappingPreferences &mappings) { m_persisted_mappings = mappings; }
     void on_dpi_changed(const wxRect &suggested_rect) override;
     const SyncResult &get_result() { return m_result; }
@@ -269,6 +275,7 @@ public:
 
 private:
     void        apply_persisted_mappings();
+    bool        validate_qds_mapping_before_sync();
     void        request_modal_close(int result);
     wxBoxSizer *create_sizer_thumbnail(wxButton *image_button, bool left);
     void        update_when_change_plate(int);

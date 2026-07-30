@@ -2623,22 +2623,25 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
         if (const auto *multi_colour = ams.opt<ConfigOptionStrings>("filament_multi_colour"))
             filament_multi_color = multi_colour->values;
         //y59
-        auto slot_id    = ams.opt_string("slot_id", 0u);
+        const auto slot_id = ams.opt_string("slot_id", 0u);
         const auto slot_index = parse_slot_index(slot_id);
         if (!slot_index) {
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": Box slot identifier became invalid after preflight";
             return 0;
         }
-        auto ams_id     = std::to_string(*slot_index / 4 + 1);
+        constexpr const char *qds_external_mapping_id = "255";
+        const bool is_external_spool = tray_name == "Ext";
+        const std::string mapping_slot_id = is_external_spool ? qds_external_mapping_id : slot_id;
+        const std::string ams_id = is_external_spool ? qds_external_mapping_id : std::to_string(*slot_index / 4 + 1);
 
         ams_infos.push_back({filament_id.empty() ? false : true,false, filament_color});
-        AMSMapInfo temp = {ams_id, slot_id};
+        AMSMapInfo temp = {ams_id, mapping_slot_id};
         ams_array_maps.push_back(temp);
         index++;
         if (filament_id.empty()) {
             if (use_map) {
                 for (int j = maps.size() - 1; j >= 0; j--) {
-                    if (maps[j].slot_id == slot_id && maps[j].ams_id == ams_id) {
+                    if (maps[j].slot_id == mapping_slot_id && maps[j].ams_id == ams_id) {
                         maps.erase(j);
                     }
                 }
