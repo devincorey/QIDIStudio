@@ -1,6 +1,7 @@
 #ifndef slic3r_GUI_DeviceCore_QDSBoxSync_hpp_
 #define slic3r_GUI_DeviceCore_QDSBoxSync_hpp_
 
+#include <array>
 #include <cstddef>
 #include <map>
 #include <optional>
@@ -16,6 +17,8 @@ constexpr int max_box_slots = slots_per_box * max_box_count;
 struct PrinterMetadata
 {
     std::optional<std::string> configured_model;
+    // Empty means the connected printer did not advertise a model.
+    std::vector<std::string> reported_models;
     // nullopt means absent; an engaged empty vector means present but invalid.
     std::optional<std::vector<double>> reported_nozzles;
 };
@@ -34,6 +37,7 @@ struct RawSlot
 {
     int                        slot_index{-1};
     bool                       occupied{false};
+    bool                       occupancy_known{false};
     int                        vendor_index{-1};
     int                        filament_index{-1};
     std::string                material_name;
@@ -116,8 +120,14 @@ using MappingPreferences = std::map<int, MappingPreference>;
 
 std::string normalize_model_name(const std::string &model);
 std::string mapping_device_identity(const std::string &host, const std::string &runtime_id);
+std::string mapping_storage_key(const std::string &printer_profile);
 bool valid_catalog_index(int index, std::size_t catalog_size);
 bool qidi_filament_ids_compatible(const std::string &project_preset_id, const std::string &slot_preset_id);
+bool filament_selection_compatible(const std::string &project_material,
+                                   const std::string &project_preset_id,
+                                   const std::string &slot_material,
+                                   const std::string &slot_preset_id,
+                                   bool enforce_material);
 bool prefer_filament_match(bool candidate_exact, double candidate_colour_distance,
                            bool current_exact, double current_colour_distance);
 std::optional<std::string> normalize_colour(const std::optional<std::string> &colour);
@@ -129,8 +139,14 @@ CompatibilityResult resolve_compatibility(const PrinterMetadata &metadata,
                                           double nozzle_tolerance = 0.001);
 
 BoxSnapshot normalize_snapshot(const BoxSnapshotInput &input);
+bool snapshot_ready_for_sync(const BoxSnapshotInput &input,
+                             bool box_count_seen,
+                             const std::array<bool, max_box_slots> &occupancy_seen);
 BoxSnapshotInput merge_snapshot_patch(BoxSnapshotInput input, const BoxSnapshotPatch &patch);
 bool mapping_is_current(const BoxSnapshot &snapshot, int slot_index, const std::string &filament_preset_id);
+bool mapping_preference_is_current(const BoxSnapshot &snapshot,
+                                   const MappingPreference &preference,
+                                   const std::string &project_preset_id);
 std::string serialize_mapping_preferences(const MappingContext &context, const MappingPreferences &preferences);
 MappingPreferences deserialize_mapping_preferences(const std::string &stored,
                                                     const MappingContext &context,

@@ -134,25 +134,39 @@ namespace Slic3r
         if (is_from_sd_card) {
             auto qds_dev = GUI::wxGetApp().qdsdevmanager;
             auto qds_obj = qds_dev ? qds_dev->getSelectedDevice() : nullptr;
-            if (!qds_obj)
+            if (!qds_obj) {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": QDS mapping device is unavailable";
                 return -1;
-            filament_colors = qds_obj->m_filament_colors;
-            filament_type = qds_obj->m_filament_type;
-            filament_id = qds_obj->m_filament_id;
-            slot_id = qds_obj->m_slot_id;
-            box_count = qds_obj->m_box_count;
+            }
+            const auto box_state = qds_obj->getBoxMappingState();
+            if (!box_state.ready) {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": QDS Box mapping snapshot is not ready";
+                return -1;
+            }
+            filament_colors = box_state.filament_colors;
+            filament_type = box_state.filament_type;
+            filament_id = box_state.filament_id;
+            slot_id = box_state.slot_id;
+            box_count = box_state.box_count;
         }
         //y80
         else if (dev_id != "") {
             auto qds_manager = GUI::wxGetApp().qdsdevmanager;
             auto qds_device = qds_manager ? qds_manager->getDevice(dev_id) : nullptr;
-            if (!qds_device)
+            if (!qds_device) {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": QDS mapping device is unavailable";
                 return -1;
-            filament_colors = qds_device->m_filament_colors;
-            filament_type = qds_device->m_filament_type;
-            filament_id = qds_device->m_filament_id;
-            slot_id = qds_device->m_slot_id;
-            box_count = qds_device->m_box_count;
+            }
+            const auto box_state = qds_device->getBoxMappingState();
+            if (!box_state.ready) {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": QDS Box mapping snapshot is not ready";
+                return -1;
+            }
+            filament_colors = box_state.filament_colors;
+            filament_type = box_state.filament_type;
+            filament_id = box_state.filament_id;
+            slot_id = box_state.slot_id;
+            box_count = box_state.box_count;
         } else {
             filament_colors = GUI::wxGetApp().plater()->box_msg.filament_colors;
             filament_type = GUI::wxGetApp().plater()->box_msg.filament_type;
@@ -162,8 +176,11 @@ namespace Slic3r
         }
 
         const size_t aligned_size = std::min({filament_colors.size(), filament_type.size(), filament_id.size(), slot_id.size()});
-        if (aligned_size == 0)
+        if (aligned_size == 0) {
+            if (is_from_sd_card || !dev_id.empty())
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": QDS Box mapping snapshot has no aligned slot data";
             return -1;
+        }
 
         std::vector<FilamentInfo> box_filament_infos;
         const size_t box_slot_count = std::min<size_t>(GUI::QDSBoxSync::max_box_slots,
@@ -481,10 +498,10 @@ namespace Slic3r
                 //     distance_map[picked_src_idx][picked_tar_idx].distance);
                 // BOOST_LOG_TRIVIAL(info) << std::string(buffer);
 
-                result[picked_src_idx].tray_id  = distance_map[k][picked_tar_idx].tray_id;
+                result[picked_src_idx].tray_id  = distance_map[picked_src_idx][picked_tar_idx].tray_id;
                 result[picked_src_idx].color = box_filament_infos[picked_tar_idx].color;
                 result[picked_src_idx].type     = box_filament_infos[picked_tar_idx].type;
-                result[picked_src_idx].distance = distance_map[k][picked_tar_idx].distance;
+                result[picked_src_idx].distance = distance_map[picked_src_idx][picked_tar_idx].distance;
                 result[picked_src_idx].filament_id = box_filament_infos[picked_tar_idx].filament_id;
                 result[picked_src_idx].ams_id = box_filament_infos[picked_tar_idx].ams_id;
                 result[picked_src_idx].slot_id = box_filament_infos[picked_tar_idx].slot_id;

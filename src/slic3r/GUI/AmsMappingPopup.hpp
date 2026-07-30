@@ -84,6 +84,7 @@ struct TrayData
     int             remain = MAPPING_ITEM_INVALID_REMAIN;
     std::string     name;
     std::string     filament_type;
+    std::string     filament_preset_id;
     wxColour        colour;
     std::vector<wxColour> material_cols = std::vector<wxColour>();
 
@@ -296,6 +297,7 @@ public:
     int         m_current_filament_id;
     ShowType    m_show_type{ShowType::RIGHT};
     std::string m_tag_material;
+    std::string m_tag_filament_id;
     wxScrolledWindow *m_scrolled_window{nullptr};
     wxBoxSizer *m_sizer_main{nullptr};
     wxBoxSizer *m_sizer_main_h{nullptr};
@@ -339,6 +341,7 @@ public:
     void         set_send_win(wxWindow* win) {send_win = win;};
     void         update_materials_list(std::vector<std::string> list);
     void         set_tag_texture(std::string texture);
+    void         set_tag_filament_id(const std::string &filament_id) { m_tag_filament_id = filament_id; }
     //y80
     void         update(MachineObject* obj, const std::vector<FilamentInfo>& ams_mapping_result, std::shared_ptr<QDSDevice> qds_obj=nullptr, bool use_dynamic_switch = false, std::optional<PrintFromType> print_type = std::nullopt, std::string dev_id = "");
     void         update_rack_select(MachineObject* obj, bool use_dynamic_switch, std::optional<PrintFromType> print_type);
@@ -349,6 +352,7 @@ public:
     void         set_current_filament_id(int id) { m_current_filament_id = id; };
     int          get_current_filament_id(){return m_current_filament_id;};
     bool         is_match_material(std::string material) const;
+    bool         is_match_filament(const TrayData &tray_data, bool enforce_material = true) const;
     void         on_left_down(wxMouseEvent &evt);
     virtual void OnDismiss() wxOVERRIDE;
     virtual bool ProcessLeftDown(wxMouseEvent &event) wxOVERRIDE;

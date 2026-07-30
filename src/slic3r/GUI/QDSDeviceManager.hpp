@@ -9,6 +9,7 @@
 #include <mutex>
 #include <functional>
 #include <thread>
+#include <cstdint>
 #include <atomic>
 #include <vector>
 #include <chrono>
@@ -161,6 +162,22 @@ public:
         int boxMaxTemp;
         std::string type;
     };
+    struct BoxSyncState {
+        QDSBoxSync::BoxSnapshotInput snapshot_input;
+        bool                         auto_reload_detect{false};
+        bool                         ready{false};
+        std::uint64_t                generation{0};
+    };
+    struct BoxMappingState {
+        bool                     ready{false};
+        int                      box_count{0};
+        QDSBoxSync::BoxSnapshot snapshot;
+        std::vector<std::string> filament_colors;
+        std::vector<std::string> filament_type;
+        std::vector<std::string> filament_id;
+        std::vector<int>         slot_id;
+        std::vector<int>         slot_state;
+    };
 public:
     QDSDevice(const std::string dev_id, const std::string& dev_name, const std::string& dev_ip, const std::string& dev_url, const std::string& dev_type);
     ~QDSDevice() {};
@@ -173,7 +190,19 @@ public:
     void updateBoxDataByJson(const json &status);
     std::vector<float> getNozzleDiameter();
     bool setReportedNozzleDiameters(std::vector<float> diameters);
+    bool setReportedNozzleDiametersFromJson(const json &value);
+    void resetReportedNozzleMetadata();
+    void resetBoxSyncState();
     QDSBoxSync::PrinterMetadata getPrinterMetadata();
+    BoxSyncState getBoxSyncState();
+    BoxMappingState getBoxMappingState();
+    bool publishBoxMappingState(const QDSBoxSync::BoxSnapshot &snapshot,
+                                const std::vector<std::string> &filament_colors,
+                                const std::vector<std::string> &filament_type,
+                                const std::vector<std::string> &filament_id,
+                                const std::vector<int> &slot_id,
+                                const std::vector<int> &slot_state,
+                                std::uint64_t expected_generation);
     void reset_update_status(){
         box_is_update = true;
     };
@@ -283,6 +312,11 @@ public:
     std::vector<int> m_slot_state;
     QDSBoxSync::BoxSnapshotInput m_box_snapshot_input;
     QDSBoxSync::BoxSnapshot      m_box_snapshot;
+    bool m_box_count_seen{false};
+    std::array<bool, QDSBoxSync::max_box_slots> m_box_slot_occupancy_seen{};
+    bool m_box_snapshot_ready{false};
+    bool m_box_mapping_ready{false};
+    std::uint64_t m_box_snapshot_generation{0};
 
     //cj_2 print model data
 
@@ -402,6 +436,8 @@ public:
     std::vector<NetDevice> getNetDevices();
 #endif
     bool upBoxInfoToBoxMsg(std::shared_ptr<QDSDevice>& device);
+    QDSBoxSync::PrinterMetadata getPrinterMetadataForCompatibility(
+        const std::shared_ptr<QDSDevice>& device) const;
     void getFileInfo(const std::string& device_id);
     void resetBoxUpdateStatus(const std::string& device_id);
 

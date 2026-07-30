@@ -244,6 +244,7 @@ bool SyncBoxInfoDialog::is_need_show()
 {
     //init begin
     m_result.direct_sync = true;
+    m_result.sync_maps.clear();
     m_generate_fix_sizer_ams_mapping = false;
     m_ams_combo_info.clear();
     // init end
@@ -1005,6 +1006,8 @@ SyncBoxInfoDialog::SyncBoxInfoDialog(wxWindow *parentm, SyncInfo& info) :
         bSizer_button->Add(m_button_ok, 0, wxALIGN_RIGHT | wxLEFT | wxTOP, FromDIP(10));
 
         m_button_ok->Bind(wxEVT_COMMAND_BUTTON_CLICKED, [this](wxCommandEvent &e) {
+            if (m_modal_close.closing())
+                return;
             deal_ok();
             request_modal_close(wxID_YES);
         });
@@ -1223,6 +1226,7 @@ bool SyncBoxInfoDialog::do_ams_mapping(MachineObject* obj_)
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << " begin do_box_mapping result";
     const auto qds_device = m_qds_device.lock();
     const bool qds_mode = static_cast<bool>(qds_device);
+    const std::string qds_device_id = qds_device ? qds_device->m_id : std::string{};
 
     m_cur_colors_in_thumbnail.clear();
     std::vector<std::string> box_colors = m_plater->box_msg.filament_colors;
@@ -1250,14 +1254,14 @@ bool SyncBoxInfoDialog::do_ams_mapping(MachineObject* obj_)
         }
         //y80
         filament_result = DevMappingUtil::ams_filament_mapping(obj_, m_filaments, m_ams_mapping_result, map_opt, std::vector<int>(),
-                                                     wxGetApp().app_config->get_bool("ams_sync_match_full_use_color_dist") ? false : true, false, "");
+                                                     wxGetApp().app_config->get_bool("ams_sync_match_full_use_color_dist") ? false : true, false, qds_device_id);
     }
     // single nozzle
     else {
         map_opt = { false, true, false, true }; // four values: use_left_ams, use_right_ams, use_left_ext, use_right_ext
         //y80
         filament_result = DevMappingUtil::ams_filament_mapping(obj_, m_filaments, m_ams_mapping_result, map_opt, std::vector<int>(),
-                                                               wxGetApp().app_config->get_bool("ams_sync_match_full_use_color_dist") ? false : true, false, "");
+                                                               wxGetApp().app_config->get_bool("ams_sync_match_full_use_color_dist") ? false : true, false, qds_device_id);
     }
 
     if (qds_mode)
@@ -1304,7 +1308,10 @@ bool SyncBoxInfoDialog::do_ams_mapping(MachineObject* obj_)
 void SyncBoxInfoDialog::apply_persisted_mappings()
 {
     const auto qds_device = m_qds_device.lock();
-    if (!qds_device || m_persisted_mappings.empty())
+    if (!qds_device)
+        return;
+    const auto box_state = qds_device->getBoxMappingState();
+    if (!box_state.ready || m_persisted_mappings.empty())
         return;
 
     for (const auto &entry : m_persisted_mappings) {
@@ -1318,20 +1325,23 @@ void SyncBoxInfoDialog::apply_persisted_mappings()
             continue;
         }
 
+        const Preset *project_preset = wxGetApp().preset_bundle->filaments.find_preset(preference.project_preset);
         const int slot_index = preference.slot_index;
         const std::string &preset_id = preference.slot_preset_id;
-        if (!QDSBoxSync::mapping_is_current(qds_device->m_box_snapshot, slot_index, preset_id)) {
+        if (!project_preset ||
+            !QDSBoxSync::mapping_preference_is_current(box_state.snapshot, preference,
+                                                       project_preset->filament_id)) {
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": ignored stale mapping for project filament " << project_filament;
             continue;
         }
 
         auto result = std::find_if(m_ams_mapping_result.begin(), m_ams_mapping_result.end(),
                                    [project_filament](const FilamentInfo &info) { return info.id == project_filament; });
-        auto slot = std::find_if(qds_device->m_box_snapshot.slots.begin(), qds_device->m_box_snapshot.slots.end(),
+        auto slot = std::find_if(box_state.snapshot.slots.begin(), box_state.snapshot.slots.end(),
                                  [slot_index](const QDSBoxSync::BoxSlotSnapshot &snapshot_slot) {
                                      return snapshot_slot.slot_index == slot_index;
                                  });
-        if (result == m_ams_mapping_result.end() || slot == qds_device->m_box_snapshot.slots.end())
+        if (result == m_ams_mapping_result.end() || slot == box_state.snapshot.slots.end())
             continue;
 
         result->tray_id     = slot_index;
@@ -2634,7 +2644,8 @@ void SyncBoxInfoDialog::reset_and_sync_ams_list()
         bmcache.parse_color4(colour, rgb);
 
         auto colour_rgb = wxColour((int) rgb[0], (int) rgb[1], (int) rgb[2], (int) rgb[3]);
-        if (extruder >= materials.size() || extruder < 0 || extruder >= display_materials.size())
+        if (extruder < 0 || static_cast<size_t>(extruder) >= materials.size() ||
+            static_cast<size_t>(extruder) >= display_materials.size() || static_cast<size_t>(extruder) >= m_filaments_id.size())
             continue;
         if (is_mixed_opt && extruder < (int) is_mixed_opt->values.size() && is_mixed_opt->values[extruder])
             continue;
@@ -2684,7 +2695,8 @@ void SyncBoxInfoDialog::reset_and_sync_ams_list()
 
         contronal_index++;
         item->Bind(wxEVT_LEFT_UP, [this, item, materials, extruder](wxMouseEvent &e) {});
-        item->Bind(wxEVT_LEFT_DOWN, [this, item, materials, extruder, item_index_str](wxMouseEvent &e) {
+        const std::string project_filament_id = m_filaments_id[extruder];
+        item->Bind(wxEVT_LEFT_DOWN, [this, item, materials, project_filament_id, extruder, item_index_str](wxMouseEvent &e) {
             MaterialHash::iterator iter = m_materialList.begin();
             while (iter != m_materialList.end()) {
                 int           id   = iter->first;
@@ -2737,6 +2749,8 @@ void SyncBoxInfoDialog::reset_and_sync_ams_list()
                     };
                     m_mapping_popup.set_reset_callback(reset_call_back);
                     m_mapping_popup.set_tag_texture(materials[extruder]);
+                    if (qds_device)
+                        m_mapping_popup.set_tag_filament_id(project_filament_id);
                     m_mapping_popup.set_send_win(this);
                     //y80
                     m_mapping_popup.update(obj_, m_ams_mapping_result, qds_device, is_selector, std::nullopt, "");
