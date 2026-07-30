@@ -170,9 +170,10 @@ public:
     bool is_online();
     void updateFilamentConfig();    //When "m_frp_url" is updated, update the config file.
 
-    void updateBoxDataByJson(const json status);
+    void updateBoxDataByJson(const json &status);
     std::vector<float> getNozzleDiameter();
-    bool hasReportedNozzleDiameter() const { return m_has_reported_nozzle_diameter; }
+    bool setReportedNozzleDiameters(std::vector<float> diameters);
+    QDSBoxSync::PrinterMetadata getPrinterMetadata();
     void reset_update_status(){
         box_is_update = true;
     };
@@ -236,6 +237,7 @@ public:
     //y78
     std::vector<float> m_nozzle_diameter { 0.4f };
     bool m_has_reported_nozzle_diameter{ false };
+    bool m_reported_nozzle_metadata_valid{ false };
 
 
 	std::string     m_print_total_duration;

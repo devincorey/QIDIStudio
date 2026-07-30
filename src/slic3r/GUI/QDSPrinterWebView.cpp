@@ -716,25 +716,47 @@ void QDSPrinterWebView::TransitionToCloudDevice(const NetDevice& device, DeviceB
                     if (resultJson.contains("data") && resultJson["data"].is_object()) {
                         if (resultJson["data"].contains("printing.polar_cooler") && resultJson["data"]["printing.polar_cooler"].is_string()) {
                             std::shared_ptr<QDSDevice> tempQdsDev = m_device_manager->getDevice(device.mac_address);
-                            tempQdsDev->m_enable_polar_cooler = resultJson["data"]["printing.polar_cooler"].get<std::string>() == "1";
+                            if (tempQdsDev)
+                                tempQdsDev->m_enable_polar_cooler = resultJson["data"]["printing.polar_cooler"].get<std::string>() == "1";
                         }
 
                         if (resultJson["data"].contains("nozzle.diameter")) {
                             std::shared_ptr<QDSDevice> tempQdsDev = m_device_manager->getDevice(device.mac_address);
-                            tempQdsDev->m_nozzle_diameter.clear();
+                            if (!tempQdsDev)
+                                continue;
                             std::vector<float> nozzle_diameter_temp;
-                            if (resultJson["data"]["nozzle.diameter"].is_string()) {
-                                nozzle_diameter_temp.push_back(std::stof(resultJson["data"]["nozzle.diameter"].get<std::string>()));
-                                tempQdsDev->m_nozzle_diameter = nozzle_diameter_temp;
+                            bool nozzle_metadata_valid = true;
+                            auto append_nozzle = [&nozzle_diameter_temp, &nozzle_metadata_valid](const json &value) {
+                                try {
+                                    if (value.is_number()) {
+                                        nozzle_diameter_temp.push_back(value.get<float>());
+                                    } else if (value.is_string()) {
+                                        const std::string text = value.get<std::string>();
+                                        size_t parsed = 0;
+                                        const float diameter = std::stof(text, &parsed);
+                                        if (parsed != text.size())
+                                            throw std::invalid_argument("nozzle diameter contains trailing characters");
+                                        nozzle_diameter_temp.push_back(diameter);
+                                    } else {
+                                        nozzle_metadata_valid = false;
+                                    }
+                                } catch (const std::exception &) {
+                                    nozzle_metadata_valid = false;
+                                }
+                            };
+                            if (resultJson["data"]["nozzle.diameter"].is_string() ||
+                                resultJson["data"]["nozzle.diameter"].is_number()) {
+                                append_nozzle(resultJson["data"]["nozzle.diameter"]);
                             }
                             else if (resultJson["data"]["nozzle.diameter"].is_array()) {
                                 for (const auto& item : resultJson["data"]["nozzle.diameter"]) {
-                                    if (item.is_string()) {
-                                        nozzle_diameter_temp.push_back(std::stof(item.get<std::string>()));
-                                    }
+                                    append_nozzle(item);
                                 }
-                                tempQdsDev->m_nozzle_diameter = nozzle_diameter_temp;
                             }
+                            if (!nozzle_metadata_valid)
+                                nozzle_diameter_temp.clear();
+                            if (!tempQdsDev->setReportedNozzleDiameters(std::move(nozzle_diameter_temp)))
+                                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": cloud printer returned empty nozzle metadata";
                         }
                     }
                 }
