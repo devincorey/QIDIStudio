@@ -373,15 +373,19 @@ public:
         memDc.SetTextForeground(StateColor::darkModeColorFor(wxColor(134, 134, 134)));
         memDc.DrawLabel(m_constant_text.version, version_rect, wxALIGN_LEFT | wxALIGN_BOTTOM);
 
+        wxString build_label = wxString::FromUTF8(QDT_LOCAL_BUILD_LABEL);
 #if QDT_INTERNAL_TESTING
-        wxString versionText = QDT_INTERNAL_TESTING == 1 ? _L("Internal Version") : _L("Beta Version");
-        wxSize text_rect = memDc.GetTextExtent(versionText);
-        int start_x = (title_rect.GetLeft() + version_rect.GetRight()) / 2 - text_rect.GetWidth();
-        int start_y = version_rect.GetBottom() + 10;
-        wxRect internal_sign_rect(wxPoint(start_x, start_y), wxSize(text_rect));
-        memDc.SetFont(m_constant_text.title_font);
-        memDc.DrawLabel(versionText, internal_sign_rect, wxALIGN_TOP | wxALIGN_LEFT);
+        if (build_label.empty())
+            build_label = QDT_INTERNAL_TESTING == 1 ? _L("Internal Version") : _L("Beta Version");
 #endif
+        if (!build_label.empty()) {
+            memDc.SetFont(m_constant_text.version_font);
+            wxSize label_size = memDc.GetTextExtent(build_label);
+            int start_x = (width - label_size.GetWidth()) / 2;
+            int start_y = version_rect.GetBottom() + FromDIP(10 * m_scale);
+            wxRect build_label_rect(wxPoint(start_x, start_y), label_size);
+            memDc.DrawLabel(build_label, build_label_rect, wxALIGN_TOP | wxALIGN_LEFT);
+        }
 
         // load bitmap for logo
         BitmapCache bmp_cache;
