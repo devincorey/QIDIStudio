@@ -479,9 +479,8 @@ protected:
 
     CameraItem *m_setting_button;
     CameraItem *m_camera_fullscreen_button{ nullptr };
-    wxBoxSizer *m_camera_media_sizer{ nullptr };
     CameraFullscreenFrame *m_camera_fullscreen_frame{ nullptr };
-    wxPanel *m_camera_placeholder{ nullptr };
+    VideoPanel *m_video_panel{ nullptr };
 
     wxBitmap m_bitmap_camera;
     ScalableBitmap m_bitmap_sdcard_state_normal;
@@ -517,8 +516,7 @@ protected:
     wxStaticBitmap *m_bitmap_static_use_weight;
 
 
-    wxMediaCtrl3 *  m_media_ctrl;
-    MediaPlayCtrl * m_media_play_ctrl;
+    MediaPlayCtrl * m_media_play_ctrl{ nullptr };
 
     Label *         m_staticText_printing;
     wxStaticBitmap *m_bitmap_thumbnail;
@@ -685,6 +683,8 @@ protected:
     virtual void on_axis_ctrl_e_up_10(wxCommandEvent &event) { event.Skip(); }
     virtual void on_axis_ctrl_e_down_10(wxCommandEvent &event) { event.Skip(); }
     virtual void on_nozzle_selected(wxCommandEvent &event) { event.Skip(); }
+    void on_camera_state_changed(wxMediaEvent &event);
+    void update_camera_fullscreen_state();
 
 
 public:
