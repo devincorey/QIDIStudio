@@ -584,6 +584,7 @@ void VideoPanel::Stop()
     
     m_url.reset();
     m_frame = m_idle_image;
+    ++m_frame_generation;
     m_video_size = wxDefaultSize;
     m_frame_size = wxDefaultSize;
     
@@ -607,6 +608,7 @@ void VideoPanel::SetIdleImage(wxString const &image)
         //y77
         m_idle_image = create_scaled_bitmap_form_path(image.ToStdString(), 1046, 601).ConvertToImage();
         m_frame = m_idle_image;
+        ++m_frame_generation;
 
         if (m_frame.IsOk()) {
             CallAfter([this] { 
@@ -632,6 +634,12 @@ wxSize VideoPanel::GetVideoSize()
 {
     std::unique_lock<std::mutex> lk(m_mutex);
     return m_video_size;
+}
+
+VideoFrameSnapshot VideoPanel::GetFrameSnapshot() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return {m_frame, m_frame_generation};
 }
 
 wxSize VideoPanel::DoGetBestSize() const
@@ -726,6 +734,7 @@ void VideoPanel::PlayThread()
 
             if (!currentUrl) {
                 m_frame = m_idle_image;
+                ++m_frame_generation;
                 m_state = wxMEDIASTATE_STOPPED;
                 
                 wxMediaEvent stateEvent(wxEVT_MEDIA_STATECHANGED);
@@ -806,6 +815,7 @@ void VideoPanel::PlayThread()
                         std::lock_guard<std::mutex> lock(m_mutex);
                         if (m_url == currentUrl && (!m_frame.IsOk() || !m_frame.IsSameAs(newImage))) {
                             m_frame = newImage;
+                            ++m_frame_generation;
                             imageChanged = true;
 
                             UpdateFrameStatistics();
@@ -850,10 +860,11 @@ void VideoPanel::PlayThread()
             if (m_url == currentUrl) {
                 m_error = 0;
                 m_frame = wxImage();
+                ++m_frame_generation;
                 m_video_size = wxDefaultSize;
                 m_frame_size = wxDefaultSize;
                 
-                NotifyStopped();
+                NotifyStoppedLocked();
             }
         }
     }
@@ -895,12 +906,12 @@ void VideoPanel::SetErrorAndNotify(int errorCode, const std::string& errorMsg)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_error = errorCode;
+        NotifyStoppedLocked();
     }
-    NotifyStopped();
     wxLogError("VideoPanel: %s", errorMsg);
 }
 
-void VideoPanel::NotifyStopped()
+void VideoPanel::NotifyStoppedLocked()
 {
     m_state = wxMEDIASTATE_STOPPED;
     wxMediaEvent event(wxEVT_MEDIA_STATECHANGED);
