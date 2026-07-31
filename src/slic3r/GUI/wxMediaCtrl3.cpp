@@ -598,6 +598,7 @@ void VideoPanel::Stop()
     m_start_video_requested = false;
     m_stop_video_requested = true;
     m_frame = m_idle_image;
+    ++m_frame_generation;
     m_video_size = wxDefaultSize;
     m_frame_size = wxDefaultSize;
     
@@ -615,12 +616,12 @@ void VideoPanel::Stop()
 
 void VideoPanel::SetIdleImage(wxString const &image)
 {
-
+    std::unique_lock<std::mutex> lk(m_mutex);
     if (m_url == nullptr) {
-        std::unique_lock<std::mutex> lk(m_mutex);
         //y77
         m_idle_image = create_scaled_bitmap_form_path(image.ToStdString(), 1046, 601).ConvertToImage();
         m_frame = m_idle_image;
+        ++m_frame_generation;
 
         if (m_frame.IsOk()) {
             CallAfter([this] { 
@@ -646,6 +647,12 @@ wxSize VideoPanel::GetVideoSize()
 {
     std::unique_lock<std::mutex> lk(m_mutex);
     return m_video_size;
+}
+
+VideoFrameSnapshot VideoPanel::GetFrameSnapshot() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return {m_frame, m_frame_generation};
 }
 
 wxSize VideoPanel::DoGetBestSize() const
@@ -760,6 +767,7 @@ void VideoPanel::PlayThread()
     using namespace std::chrono_literals;
 
     while (!m_exit_flag) {
+        std::shared_ptr<std::string> current_url;
         // 等待播放指令
         {
             std::unique_lock<std::mutex> lk(m_mutex);
@@ -768,6 +776,9 @@ void VideoPanel::PlayThread()
             });
             if (m_exit_flag) break;
             m_start_video_requested = false;
+            current_url = m_url;
+            if (!current_url || current_url->empty())
+                continue;
 
             ResetPlaybackState();
             m_state = wxMEDIASTATE_PLAYING;
@@ -780,7 +791,7 @@ void VideoPanel::PlayThread()
         bool shouldContinue = true;
 
         auto qds_dev_obj = Slic3r::GUI::wxGetApp().qdsdevmanager->getSelectedDevice();
-        bool support_p2p = qds_dev_obj->active_p2p;
+        bool support_p2p = qds_dev_obj && qds_dev_obj->active_p2p;
 
         if(support_p2p){
 #if QDT_RELEASE_TO_PUBLIC
@@ -803,6 +814,7 @@ void VideoPanel::PlayThread()
                             m_frame = newImage;
                         else
                             m_frame = m_idle_image;
+                        ++m_frame_generation;
                         m_video_size = wxSize(newImage.GetWidth(), newImage.GetHeight());
                         UpdateFrameStatistics();
                     }
@@ -859,12 +871,16 @@ void VideoPanel::PlayThread()
             if (shouldContinue) {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_error = 0;
-                NotifyStopped();
+                NotifyStoppedLocked();
             }
             p2p.off(videoToken);
             p2p.off(stateToken);
 #endif
-            m_frame = m_idle_image;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_frame = m_idle_image;
+                ++m_frame_generation;
+            }
         } else {
             // ============================================================
             // 方式二：URL 下载 JPEG 帧
@@ -874,7 +890,7 @@ void VideoPanel::PlayThread()
             curl = curl_easy_init();
             if (!curl) { SetErrorAndNotify(-1, "Failed to init CURL"); continue; }
 
-            curl_easy_setopt(curl, CURLOPT_URL, m_url->c_str());
+            curl_easy_setopt(curl, CURLOPT_URL, current_url->c_str());
             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
             curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
             curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
@@ -905,6 +921,7 @@ void VideoPanel::PlayThread()
                     if (newImage.LoadFile(imgStream, wxBITMAP_TYPE_JPEG)) {
                         std::lock_guard<std::mutex> lock(m_mutex);
                         m_frame = newImage;
+                        ++m_frame_generation;
                         m_video_size = wxSize(newImage.GetWidth(), newImage.GetHeight());
                         adjust_frame_size(m_frame_size, m_video_size, GetSize());
                         UpdateFrameStatistics();
@@ -928,10 +945,14 @@ void VideoPanel::PlayThread()
             if (shouldContinue) {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_error = 0;
-                NotifyStopped();
+                NotifyStoppedLocked();
             }
             if (curl) curl_easy_cleanup(curl);
-            m_frame = m_idle_image;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_frame = m_idle_image;
+                ++m_frame_generation;
+            }
         }
     }
 }
@@ -969,12 +990,12 @@ void VideoPanel::SetErrorAndNotify(int errorCode, const std::string& errorMsg)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_error = errorCode;
+        NotifyStoppedLocked();
     }
-    NotifyStopped();
     wxLogError("VideoPanel: %s", errorMsg);
 }
 
-void VideoPanel::NotifyStopped()
+void VideoPanel::NotifyStoppedLocked()
 {
     m_state = wxMEDIASTATE_STOPPED;
     wxMediaEvent event(wxEVT_MEDIA_STATECHANGED);

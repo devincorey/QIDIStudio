@@ -6,6 +6,8 @@
 
 #include <wx/window.h>
 
+#include <utility>
+
 namespace Slic3r { namespace GUI {
 
 namespace {
@@ -17,8 +19,7 @@ constexpr NSInteger kCameraFullscreenWindowLevel = NSModalPanelWindowLevel;
 struct CameraFullscreenEscapeMonitor
 {
     id monitor{ nil };
-    CameraFullscreenEscapeCallback callback{ nullptr };
-    void *context{ nullptr };
+    std::function<void()> callback;
 };
 
 struct CameraFullscreenPresentationState
@@ -37,15 +38,14 @@ NSWindow *camera_fullscreen_window(wxWindow *window)
 
 } // namespace
 
-void *install_camera_fullscreen_escape_monitor(CameraFullscreenEscapeCallback callback, void *context)
+void *install_camera_fullscreen_escape_monitor(std::function<void()> callback)
 {
     auto *state = new CameraFullscreenEscapeMonitor;
-    state->callback = callback;
-    state->context = context;
+    state->callback = std::move(callback);
     state->monitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
         if ([event keyCode] == EscapeKeyCode) {
             if (state->callback)
-                state->callback(state->context);
+                state->callback();
             return nil;
         }
         return event;
