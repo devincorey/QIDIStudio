@@ -122,6 +122,12 @@ private:
 #endif
 
 //y76
+struct VideoFrameSnapshot
+{
+    wxImage  image;
+    uint64_t generation{0};
+};
+
 class VideoPanel : public wxPanel
 {
 public:
@@ -140,6 +146,7 @@ public:
     wxMediaState GetState();
     int GetLastError();
     wxSize GetVideoSize();
+    VideoFrameSnapshot GetFrameSnapshot() const;
     
     wxSize DoGetBestSize() const override;
     
@@ -154,7 +161,7 @@ protected:
     
 private:
     void PlayThread();
-    void NotifyStopped();
+    void NotifyStoppedLocked();
     void ResetPlaybackState();
     void UpdateFrameStatistics();
     void SetErrorAndNotify(int errorCode, const std::string& errorMsg);
@@ -168,6 +175,7 @@ private:
     
     wxImage m_idle_image;
     wxImage m_frame;
+    uint64_t m_frame_generation{0};
     wxSize m_video_size = wxDefaultSize;
     wxSize m_frame_size = wxDefaultSize;
     
@@ -178,7 +186,7 @@ private:
     std::chrono::steady_clock::time_point m_last_PTS_expected;
     std::chrono::steady_clock::time_point m_last_PTS_practical;
     
-    std::mutex m_mutex;
+    mutable std::mutex m_mutex;
     std::condition_variable m_cond;
     std::thread m_thread;
     std::atomic<bool> m_exit_flag{false};
