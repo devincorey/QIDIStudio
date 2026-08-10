@@ -6,6 +6,7 @@
 #include <utility>
 
 #include <wx/popupwin.h>
+#include <wx/weakref.h>
 
 namespace Slic3r { namespace GUI {
 
@@ -27,6 +28,23 @@ inline void dismiss_transient_windows(std::initializer_list<wxPopupTransientWind
 {
     for (wxPopupTransientWindow *popup : popups)
         dismiss_transient_popup(popup);
+}
+
+// Transient popups often highlight the control that opened them. Store that
+// control weakly and clear it before the popup disappears so a destroyed owner
+// cannot be dereferenced and a stale selection outline cannot survive dismissal.
+template <typename SelectionWindow, typename ClearSelection>
+bool clear_transient_selection(wxWeakRef<SelectionWindow> &selection, ClearSelection &&clear_selection)
+{
+    SelectionWindow *selected = selection.get();
+    selection = static_cast<SelectionWindow *>(nullptr);
+    if (!selected || selected->IsBeingDeleted())
+        return false;
+
+    std::forward<ClearSelection>(clear_selection)(*selected);
+    selected->Refresh(false);
+    selected->Update();
+    return true;
 }
 
 // Heap-allocated popup windows are top-level windows on macOS and are not
