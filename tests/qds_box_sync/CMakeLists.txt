@@ -9,7 +9,7 @@ target_include_directories(${_TEST_NAME}_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src
 )
 
-target_link_libraries(${_TEST_NAME}_tests test_common boost_headeronly)
+target_link_libraries(${_TEST_NAME}_tests test_common boost_headeronly Boost::filesystem)
 set_property(TARGET ${_TEST_NAME}_tests PROPERTY FOLDER "tests")
 set_property(TARGET ${_TEST_NAME}_tests PROPERTY MACOSX_BUNDLE FALSE)
 add_test(${_TEST_NAME}_tests ${_TEST_NAME}_tests "${CATCH_EXTRA_ARGS} exclude:[NotWorking]")
