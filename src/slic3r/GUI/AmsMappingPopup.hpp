@@ -22,6 +22,7 @@
 #include <wx/spinctrl.h>
 #include <wx/artprov.h>
 #include <wx/wrapsizer.h>
+#include <wx/weakref.h>
 
 #include "GUI_Utils.hpp"
 #include "wxExtensions.hpp"
@@ -283,7 +284,7 @@ public:
     AmsMapingPopup(wxWindow *parent,bool use_in_sync_dialog = false);
     ~AmsMapingPopup() override;
 
-    MaterialItem* m_parent_item{ nullptr };
+    wxWeakRef<MaterialItem> m_parent_item;
 
     wxWindow* send_win{ nullptr };
     std::vector<std::string> m_materials_list;
@@ -360,7 +361,7 @@ public:
     virtual void OnDismiss() wxOVERRIDE;
     virtual bool ProcessLeftDown(wxMouseEvent &event) wxOVERRIDE;
     void         paintEvent(wxPaintEvent &evt);
-    void         set_parent_item(MaterialItem* item) {m_parent_item = item;};
+    void         set_parent_item(MaterialItem* item);
     void         set_show_type(ShowType type) { m_show_type = type; };
 
 #ifdef __APPLE__
@@ -382,6 +383,8 @@ public:
     void EnableExtMappingFilaTypeCheck(bool to_check = true) { m_ext_mapping_filatype_check = to_check;} ;
 
 private:
+    void clear_parent_item_selection();
+
     // update
     void update_title(MachineObject* obj);
     void update_ams_tips(MachineObject* obj);

@@ -976,16 +976,17 @@ AmsMapingPopup::AmsMapingPopup(wxWindow *parent, bool use_in_sync_dialog) :
      Fit();
 
      Bind(wxEVT_SHOW, [this](wxShowEvent& e) {
-         if (e.IsShown() && m_parent_item)
+         MaterialItem *parent_item = m_parent_item.get();
+         if (e.IsShown() && parent_item)
          {
-             auto show_pos = m_parent_item->ClientToScreen(wxPoint(0, 0));
-             int  display_idx = wxDisplay::GetFromWindow(m_parent_item);
+             auto show_pos = parent_item->ClientToScreen(wxPoint(0, 0));
+             int  display_idx = wxDisplay::GetFromWindow(parent_item);
 
              if (display_idx == wxNOT_FOUND)
                  display_idx = 0;
 
              wxRect screen_size = wxDisplay(display_idx).GetClientArea();
-             auto   parent_size = m_parent_item->GetRect();
+             auto   parent_size = parent_item->GetRect();
              auto   content_size = m_sizer_main_h->GetMinSize();
              int    popup_width  = content_size.x + FromDIP(28);
              int    popup_height = content_size.y;
@@ -1061,9 +1062,23 @@ void AmsMapingPopup::set_reset_callback(ResetCallback callback) {
 
 AmsMapingPopup::~AmsMapingPopup()
 {
+    clear_parent_item_selection();
 #ifdef __APPLE__
     destroy_tip_popup();
 #endif
+}
+
+void AmsMapingPopup::set_parent_item(MaterialItem *item)
+{
+    if (m_parent_item.get() == item)
+        return;
+    clear_parent_item_selection();
+    m_parent_item = item;
+}
+
+void AmsMapingPopup::clear_parent_item_selection()
+{
+    clear_transient_selection(m_parent_item, [](MaterialItem &item) { item.on_normal(); });
 }
 
 void AmsMapingPopup::show_reset_button() {
@@ -1267,6 +1282,7 @@ void AmsMapingPopup::destroy_tip_popup()
 
 void AmsMapingPopup::Dismiss()
 {
+    clear_parent_item_selection();
     PopupWindow::Dismiss();
 #ifdef __APPLE__
     destroy_tip_popup();
@@ -1275,9 +1291,11 @@ void AmsMapingPopup::Dismiss()
 
 void AmsMapingPopup::OnDismiss()
 {
+    clear_parent_item_selection();
 #ifdef __APPLE__
     destroy_tip_popup();
 #endif
+    PopupWindow::OnDismiss();
 }
 
 bool AmsMapingPopup::ProcessLeftDown(wxMouseEvent &event)
