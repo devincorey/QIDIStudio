@@ -2,6 +2,7 @@
 
 #include "slic3r/GUI/DeviceCore/QDSBoxSync.hpp"
 #include "libslic3r/ProjectTask.hpp"
+#include "libslic3r/ResultFilePath.hpp"
 
 using namespace Slic3r::GUI::QDSBoxSync;
 
@@ -754,4 +755,25 @@ TEST_CASE("external-spool material policy does not weaken exact QIDI identity",
     auto wrong_qidi_identity = relaxed;
     wrong_qidi_identity.project_preset_id = "QD_0_1_6";
     REQUIRE_FALSE(apply_mapping_selection(mapping, snapshot, wrong_qidi_identity));
+}
+
+TEST_CASE("result diagnostics never default inside a signed app bundle",
+          "[qds_box_sync][packaging][result_path]")
+{
+    namespace fs = boost::filesystem;
+    const fs::path resources = "/Applications/QIDIStudio.app/Contents/Resources";
+    const fs::path app_data = "/Users/test/Library/Application Support/QIDIStudioInternal";
+
+    REQUIRE(Slic3r::resolve_result_file_path(
+                "", resources, resources, app_data) == app_data / "result.json");
+    REQUIRE(Slic3r::resolve_result_file_path(
+                "", resources / "profiles", resources, app_data) == app_data / "result.json");
+    REQUIRE(Slic3r::resolve_result_file_path(
+                "", "/Users/test/Jobs", resources, app_data) == fs::path("/Users/test/Jobs/result.json"));
+    REQUIRE(Slic3r::resolve_result_file_path(
+                "", "/Applications/QIDIStudio.app/Contents/Resources-copy", resources, app_data) ==
+            fs::path("/Applications/QIDIStudio.app/Contents/Resources-copy/result.json"));
+    REQUIRE(Slic3r::resolve_result_file_path(
+                "/tmp/qidi-output", resources, resources, app_data) ==
+            fs::path("/tmp/qidi-output/result.json"));
 }
