@@ -580,7 +580,9 @@ public:
     //void export_amf();
     //QDS add extra param for exporting 3mf silence
     // QDS: backup
-    int export_3mf(const boost::filesystem::path& output_path = boost::filesystem::path(), SaveStrategy strategy = SaveStrategy::Default, int export_plate_idx = -1, Export3mfProgressFn proFn = nullptr);
+    int export_3mf(const boost::filesystem::path& output_path = boost::filesystem::path(), SaveStrategy strategy = SaveStrategy::Default,
+                   int export_plate_idx = -1, Export3mfProgressFn proFn = nullptr,
+                   const std::string& gcode_preamble = {}, int gcode_prediction_overhead_seconds = 600);
 
     //QDS
     void publish_project();
@@ -610,7 +612,8 @@ public:
     void suppress_background_process(const bool stop_background_process) ;
     /* -1: send current gcode if not specified
      * -2: send all gcode to target machine */
-    int send_gcode(int plate_idx = -1, Export3mfProgressFn proFn = nullptr);
+    int send_gcode(int plate_idx = -1, Export3mfProgressFn proFn = nullptr,
+                   const std::string& gcode_preamble = {}, int gcode_prediction_overhead_seconds = 600);
     void send_gcode_legacy(int plate_idx = -1, Export3mfProgressFn proFn = nullptr);
     int export_config_3mf(int plate_idx = -1, Export3mfProgressFn proFn = nullptr);
     //QDS jump to nonitor after print job finished

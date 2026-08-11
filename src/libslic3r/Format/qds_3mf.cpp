@@ -6025,6 +6025,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         bool m_skip_auxiliary { false };    // skip normal axuiliary files
         bool m_use_loaded_id { false };        // whether to use loaded id for identify_id
         bool m_share_mesh { false };        // whether to share mesh between objects
+        std::string m_gcode_preamble;
         std::string m_thumbnail_middle = PRINTER_THUMBNAIL_MIDDLE_FILE;
         std::string m_thumbnail_small  = PRINTER_THUMBNAIL_SMALL_FILE;
         std::map<void const *, std::pair<ObjectData*, ModelVolume const *>> m_shared_meshes;
@@ -6123,6 +6124,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         m_from_backup_save = store_params.strategy & SaveStrategy::Backup;
 
         m_use_loaded_id = store_params.strategy & SaveStrategy::UseLoadedId;
+        m_gcode_preamble = store_params.gcode_preamble;
 
         if (auto info = store_params.model->model_info) {
             if (auto iter = info->metadata_items.find("Thumbnail_Small"); iter != info->metadata_items.end())
@@ -6564,6 +6566,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     unsigned char digest[16];
                     MD5_CTX       ctx;
                     MD5_Init(&ctx);
+                    if (!m_gcode_preamble.empty())
+                        MD5_Update(&ctx, reinterpret_cast<const unsigned char *>(m_gcode_preamble.data()), m_gcode_preamble.size());
                     auto                        src_gcode_file = plate_data->gcode_file;
                     boost::filesystem::ifstream ifs(src_gcode_file, std::ios::binary);
                     std::string                 buf(64 * 1024, 0);
@@ -8606,6 +8610,11 @@ bool _QDS_3MF_Exporter::_add_gcode_file_to_archive(mz_zip_archive& archive, cons
                 boost::filesystem::path src_gcode_path(src_gcode_file);
                 if (!boost::filesystem::exists(src_gcode_path)) {
                     BOOST_LOG_TRIVIAL(error) << "Gcode is missing, filename = " << PathSanitizer::sanitize(src_gcode_file);
+                    result = false;
+                }
+                if (!m_gcode_preamble.empty() &&
+                    !mz_zip_writer_add_staged_data(&context, m_gcode_preamble.data(), m_gcode_preamble.size())) {
+                    BOOST_LOG_TRIVIAL(error) << "Unable to add the print-option preamble to " << gcode_in_3mf;
                     result = false;
                 }
                 boost::filesystem::ifstream ifs(src_gcode_file, std::ios::binary);

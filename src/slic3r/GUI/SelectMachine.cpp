@@ -20,6 +20,7 @@
 
 #include "DeviceCore/DevConfig.h"
 #include "DeviceCore/DevPrintOptions.h"
+#include "DeviceCore/QDSPrintOptions.hpp"
 #include "DeviceCore/DevMappingNozzle.h"
 #include "DeviceCore/DevNozzleSystem.h"
 #include "DeviceCore/DevExtensionTool.h"
@@ -85,6 +86,11 @@ wxDEFINE_EVENT(EVT_SWITCH_PRINT_OPTION, wxCommandEvent);
 wxDEFINE_EVENT(EVT_UPDATE_USER_MACHINE_LIST, wxCommandEvent);
 wxDEFINE_EVENT(EVT_PRINT_JOB_CANCEL, wxCommandEvent);
 wxDEFINE_EVENT(EVT_CLEAR_IPADDRESS, wxCommandEvent);
+
+static QDSPrintOptions::BedLevelingPreparation current_bed_leveling_preparation(PrintOption *option)
+{
+    return QDSPrintOptions::prepare_bed_leveling(option ? option->getValue() : std::string{});
+}
 
 #define INITIAL_NUMBER_OF_MACHINES 0
 
@@ -879,7 +885,12 @@ SelectMachineDialog::SelectMachineDialog(Plater *plater)
     m_checkbox_list["flow_cali"]     = option_flow_dynamics_cali;
     m_checkbox_list["nozzle_offset_cali"] = option_nozzle_offset_cali_cali;
     for (auto print_opt : m_checkbox_list_order) {
-        print_opt->Bind(EVT_SWITCH_PRINT_OPTION, [this](auto& e) { save_option_vals(); e.Skip();});
+        print_opt->Bind(EVT_SWITCH_PRINT_OPTION, [this, option_auto_bed_level, print_opt](auto& e) {
+            save_option_vals();
+            if (print_opt == option_auto_bed_level)
+                refresh_save_time(get_current_machine());
+            e.Skip();
+        });
     }
 
     option_auto_bed_level->Hide();
@@ -1736,6 +1747,7 @@ void SelectMachineDialog::refresh_save_time(MachineObject *obj)
         PartPlate* plate = m_plater->get_partplate_list().get_curr_plate();
         if (plate && plate->get_slice_result()) {
             float base_time = plate->get_slice_result()->print_statistics.modes[0].time;
+            base_time += current_bed_leveling_preparation(m_checkbox_list["bed_leveling"]).estimated_overhead_seconds;
             if (save_time.has_value()) {
                 base_time += save_time.value();
                 if (base_time < 0) base_time = 0;
@@ -2395,6 +2407,9 @@ void SelectMachineDialog::on_ok_btn(wxCommandEvent &event)
         upload_file_name += ".gcode.3mf";
         //cj_5
         // Reuse Plater packaging so imported gcode 3mf files keep their original slice info.
+        const auto bed_leveling = current_bed_leveling_preparation(m_checkbox_list["bed_leveling"]);
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": packaging bed-leveling choice in print job; overhead_seconds="
+                                << bed_leveling.estimated_overhead_seconds;
         int result = m_plater->send_gcode(m_print_plate_idx, [this](int export_stage, int current, int total, bool& cancel) {
             if (this->m_is_canceled)
                 return;
@@ -2403,7 +2418,7 @@ void SelectMachineDialog::on_ok_btn(wxCommandEvent &event)
             wxString msg = _L("Preparing print job");
             m_status_bar->update_status(msg, cancelled, 10, true);
             m_export_3mf_cancel = cancel = cancelled;
-        });
+        }, bed_leveling.gcode_preamble, bed_leveling.estimated_overhead_seconds);
 
         //cj_5
         if (m_is_canceled || m_export_3mf_cancel) {
@@ -4199,13 +4214,16 @@ void SelectMachineDialog::on_send_print()
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "print_job: get_ams_mapping_result end";
 
     if (m_print_type == PrintFromType::FROM_NORMAL) {
+        const auto bed_leveling = current_bed_leveling_preparation(m_checkbox_list["bed_leveling"]);
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": packaging bed-leveling choice in print job; overhead_seconds="
+                                << bed_leveling.estimated_overhead_seconds;
         result = m_plater->send_gcode(m_print_plate_idx, [this](int export_stage, int current, int total, bool& cancel) {
             if (this->m_is_canceled) return;
             bool     cancelled = false;
             wxString msg = _L("Preparing print job");
             m_status_bar->update_status(msg, cancelled, 10, true);
             m_export_3mf_cancel = cancel = cancelled;
-            });
+            }, bed_leveling.gcode_preamble, bed_leveling.estimated_overhead_seconds);
 
         if (m_is_canceled || m_export_3mf_cancel) {
             BOOST_LOG_TRIVIAL(info) << "print_job: m_export_3mf_cancel or m_is_canceled";
@@ -6609,12 +6627,7 @@ void SelectMachineDialog::set_default_normal(const ThumbnailData &data)
 
 #endif // __WXOSX_MAC__
     // basic info
-    auto       aprint_stats = m_plater->get_partplate_list().get_current_fff_print().print_statistics();
-    wxString   time;
-    PartPlate *plate = m_plater->get_partplate_list().get_curr_plate();
-    if (plate) {
-        if (plate->get_slice_result()) { time = wxString::Format("%s", short_time(get_time_dhms(plate->get_slice_result()->print_statistics.modes[0].time + 600.0f))); }    //y68
-    }
+    auto aprint_stats = m_plater->get_partplate_list().get_current_fff_print().print_statistics();
 
     char weight[64];
     if (wxGetApp().app_config->get("use_inches") == "1") {
@@ -6623,7 +6636,6 @@ void SelectMachineDialog::set_default_normal(const ThumbnailData &data)
         ::sprintf(weight, "%.2f g", aprint_stats.total_weight);
     }
 
-    m_stext_time->SetLabel(time);
     m_stext_weight->SetLabel(weight);
     refresh_save_time(obj_);
 }
