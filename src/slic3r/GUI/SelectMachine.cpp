@@ -4496,9 +4496,9 @@ void SelectMachineDialog::restore_qds_mapping_preferences()
 
 void SelectMachineDialog::on_set_finish_mapping(wxCommandEvent &evt)
 {
-    // The slot click posts this event after the native popup begins dismissal.
-    // Dismiss again here so every success and rejection path clears Cocoa's
-    // transient selection and invalidates the owner window.
+    // QDS slot clicks post this event without dismissing the native popup on
+    // macOS. Close it here, on the next event-loop turn, so every success and
+    // rejection path clears Cocoa's transient surface and invalidates its owner.
     m_mapping_popup.Dismiss();
 
     auto selection_data = evt.GetString();

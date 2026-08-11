@@ -206,7 +206,7 @@ public:
 
 public:
     void update_data(TrayData data);
-    void send_event(int fliament_id);
+    bool send_event(int fliament_id);
     void set_data(const wxString& tag_name, wxColour colour, wxString name, bool remain_detect, TrayData data, bool unmatch = false, std::optional<wxString> tooltip_opt = std::nullopt);
     void set_checked(bool checked);
     void set_tray_index(wxString t_index) { m_tray_index = t_index; };
