@@ -1308,6 +1308,7 @@ void SelectMachineDialog::sync_ams_mapping_result(const std::vector<FilamentInfo
             wxString ams_id = "Ext";//
             wxColour ams_col = wxColour(0xCE, 0xCE, 0xCE);
             it->second->item->set_ams_info(ams_col, ams_id);
+            it->second->item->restore_material_display();
             it->second->item->set_nozzle_info(get_mapped_nozzle_str(it->first));
         }
         return;
@@ -1351,6 +1352,12 @@ void SelectMachineDialog::sync_ams_mapping_result(const std::vector<FilamentInfo
                     cols.push_back(DevAmsTray::decode_color(col));
                 }
                 m->set_ams_info(ams_col, ams_id,f->ctype, cols);
+                if (get_current_qds_device()) {
+                    if (f->tray_id >= 0)
+                        m->set_material_display(ams_col, f->ctype, cols);
+                    else
+                        m->restore_material_display();
+                }
                 m->set_nozzle_info(get_mapped_nozzle_str(id));
                 break;
             }
@@ -4635,6 +4642,13 @@ void SelectMachineDialog::on_set_finish_mapping(wxCommandEvent &evt)
                         cols.push_back(DevAmsTray::decode_color(col));
                     }
                     m->set_ams_info(ams_col, ams_id, f->ctype, cols);
+                    if (qds_device)
+                        m->set_material_display(ams_col, f->ctype, cols);
+                    break;
+                } else if (f->id == id && qds_device) {
+                    // Reassigning a slot may unmap another project filament.
+                    // Restore that card's project colour immediately.
+                    m->restore_material_display();
                     break;
                 }
                 iter++;

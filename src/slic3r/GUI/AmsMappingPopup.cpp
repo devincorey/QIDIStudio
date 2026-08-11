@@ -58,6 +58,7 @@ const int LEFT_OFFSET = 2;
     m_rack_nozzle_bitmap = ScalableBitmap(this, "dev_rack_nozzle_print_job", 22);
 
     m_material_coloul = mcolour;
+    m_project_material_colour = mcolour;
     m_material_name = mname;
     m_ams_coloul      = wxColour(0xEE,0xEE,0xEE);
 
@@ -128,11 +129,25 @@ void MaterialItem::set_nozzle_info(const wxString& mapped_nozzle_str)
 }
 
 void MaterialItem::set_material_cols(int ctype, const std::vector<wxColour>& cols) {
-    if (m_material_ctype != ctype || m_material_cols != cols) {
-        m_material_ctype = ctype;
-        m_material_cols = cols;
-        Refresh();
-    }
+    m_project_material_ctype = ctype;
+    m_project_material_cols = cols;
+    set_material_display(m_project_material_colour, ctype, cols);
+}
+
+void MaterialItem::set_material_display(wxColour col, int ctype, const std::vector<wxColour>& cols)
+{
+    if (m_material_coloul == col && m_material_ctype == ctype && m_material_cols == cols)
+        return;
+
+    m_material_coloul = col;
+    m_material_ctype = ctype;
+    m_material_cols = cols;
+    Refresh();
+}
+
+void MaterialItem::restore_material_display()
+{
+    set_material_display(m_project_material_colour, m_project_material_ctype, m_project_material_cols);
 }
 
 void MaterialItem::reset_ams_info() {

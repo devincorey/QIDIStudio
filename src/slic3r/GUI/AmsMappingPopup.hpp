@@ -112,6 +112,8 @@ public:
                       bool record_back_info = false);
 
     void set_material_cols(int ctype, const std::vector<wxColour>& cols);
+    void set_material_display(wxColour col, int ctype, const std::vector<wxColour>& cols);
+    void restore_material_display();
 
     void reset_ams_info();
     virtual void reset_valid_info();
@@ -152,6 +154,12 @@ public:
     wxString              m_back_ams_name;
     int                   m_back_ams_ctype = 0;
     std::vector<wxColour> m_back_ams_cols  = std::vector<wxColour>();
+
+    // Preserve the sliced project's visual identity separately from the
+    // effective Box slot colour shown after a QDS mapping is selected.
+    wxColour              m_project_material_colour;
+    int                   m_project_material_ctype = 0;
+    std::vector<wxColour> m_project_material_cols;
 
     ScalableBitmap m_arraw_bitmap_gray;
     ScalableBitmap m_arraw_bitmap_white;
