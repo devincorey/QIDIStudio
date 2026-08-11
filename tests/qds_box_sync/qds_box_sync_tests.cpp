@@ -3,6 +3,7 @@
 #include <sstream>
 
 #include "slic3r/GUI/DeviceCore/QDSBoxSync.hpp"
+#include "slic3r/GUI/DeviceCore/QDSPrintOptions.hpp"
 #include "libslic3r/ProjectTask.hpp"
 #include "libslic3r/ResultFilePath.hpp"
 
@@ -824,4 +825,27 @@ TEST_CASE("result diagnostics never default inside a signed app bundle",
     REQUIRE(Slic3r::resolve_result_file_path(
                 "/tmp/qidi-output", resources, resources, app_data) ==
             fs::path("/tmp/qidi-output/result.json"));
+}
+
+TEST_CASE("QIDI bed-leveling choice is embedded in the print job",
+          "[qds_print_options][bed_leveling]")
+{
+    using Slic3r::GUI::QDSPrintOptions::prepare_bed_leveling;
+
+    const auto enabled = prepare_bed_leveling("on");
+    REQUIRE(enabled.gcode_preamble == "G31\n");
+    REQUIRE(enabled.estimated_overhead_seconds ==
+            Slic3r::GUI::QDSPrintOptions::full_bed_leveling_estimate_seconds);
+
+    const auto disabled = prepare_bed_leveling("off");
+    REQUIRE(disabled.gcode_preamble == "G32\n");
+    REQUIRE(disabled.estimated_overhead_seconds == 0);
+
+    const auto automatic = prepare_bed_leveling("auto");
+    REQUIRE(automatic.gcode_preamble.empty());
+    REQUIRE(automatic.estimated_overhead_seconds == 0);
+
+    const auto malformed = prepare_bed_leveling("OFF");
+    REQUIRE(malformed.gcode_preamble.empty());
+    REQUIRE(malformed.estimated_overhead_seconds == 0);
 }

@@ -254,6 +254,7 @@ struct StoreParams
     std::vector<PlateBBoxData*> id_bboxes;
     QDTProject* project = nullptr;
     QDTProfile* profile = nullptr;
+    std::string gcode_preamble;
 
     StoreParams() {}
 };

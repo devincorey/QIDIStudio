@@ -22715,7 +22715,8 @@ void publish(Model &model, SaveStrategy strategy)
 } // namespace
 
 // QDS: backup
-int Plater::export_3mf(const boost::filesystem::path& output_path, SaveStrategy strategy, int export_plate_idx, Export3mfProgressFn proFn)
+int Plater::export_3mf(const boost::filesystem::path& output_path, SaveStrategy strategy, int export_plate_idx, Export3mfProgressFn proFn,
+                       const std::string& gcode_preamble, int gcode_prediction_overhead_seconds)
 {
     int ret = 0;
     //if (p->model.objects.empty()) {
@@ -22829,7 +22830,9 @@ int Plater::export_3mf(const boost::filesystem::path& output_path, SaveStrategy 
 
     //QDS: add qds 3mf logic
     PlateDataPtrs plate_data_list;
-    p->partplate_list.store_to_3mf_structure(plate_data_list, (strategy & SaveStrategy::WithGcode || strategy & SaveStrategy::WithSliceInfo), export_plate_idx);
+    p->partplate_list.store_to_3mf_structure(plate_data_list,
+        (strategy & SaveStrategy::WithGcode || strategy & SaveStrategy::WithSliceInfo), export_plate_idx,
+        gcode_prediction_overhead_seconds);
 
     // QDS: backup
     PresetBundle& preset_bundle = *wxGetApp().preset_bundle;
@@ -22851,6 +22854,7 @@ int Plater::export_3mf(const boost::filesystem::path& output_path, SaveStrategy 
     store_params.id_bboxes = plate_bboxes;//QDS
     store_params.project = &p->project;
     store_params.strategy = strategy | SaveStrategy::Zip64;
+    store_params.gcode_preamble = gcode_preamble;
 
 
     // get type and color for platedata
@@ -23649,7 +23653,8 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
         }
     }
 }
-int Plater::send_gcode(int plate_idx, Export3mfProgressFn proFn)
+int Plater::send_gcode(int plate_idx, Export3mfProgressFn proFn, const std::string& gcode_preamble,
+                       int gcode_prediction_overhead_seconds)
 {
     int result = 0;
     /* generate 3mf */
@@ -23682,7 +23687,7 @@ int Plater::send_gcode(int plate_idx, Export3mfProgressFn proFn)
         strategy = SaveStrategy::Silence | SaveStrategy::SplitModel | SaveStrategy::WithGcode;
 #endif
 
-    result = export_3mf(p->m_print_job_data._3mf_path, strategy, plate_idx, proFn);
+    result = export_3mf(p->m_print_job_data._3mf_path, strategy, plate_idx, proFn, gcode_preamble, gcode_prediction_overhead_seconds);
 
     return result;
 }

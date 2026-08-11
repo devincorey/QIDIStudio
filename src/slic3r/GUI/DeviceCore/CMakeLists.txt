@@ -47,6 +47,7 @@ list(APPEND SLIC3R_GUI_SOURCES
     GUI/DeviceCore/QDSBoxSync.hpp
     GUI/DeviceCore/QDSBoxSync.cpp
     GUI/DeviceCore/QDSModalClose.hpp
+    GUI/DeviceCore/QDSPrintOptions.hpp
     GUI/DeviceCore/DevHMS.h
     GUI/DeviceCore/DevHMS.cpp
     GUI/DeviceCore/DevInfo.h
