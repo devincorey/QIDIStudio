@@ -3,8 +3,11 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <fstream>
 #include <set>
 
+#include <boost/property_tree/ini_parser.hpp>
+#include <boost/property_tree/ptree.hpp>
 #include <nlohmann/json.hpp>
 
 #include "libslic3r/ProjectTask.hpp"
@@ -75,6 +78,23 @@ bool mapping_target_matches(const FilamentInfo &mapping, const BoxSlotSnapshot &
 
     const std::string expected_colour = slot.colour.value_or("#CECECE").substr(1) + "FF";
     return mapping.type == slot.material_type.value_or("") && mapping.color == expected_colour;
+}
+
+std::optional<std::size_t> parse_catalog_index(const std::string &value, std::size_t catalog_size)
+{
+    try {
+        std::size_t parsed = 0;
+        const long index = std::stol(value, &parsed);
+        if (parsed == value.size() && index >= 0 && static_cast<std::size_t>(index) < catalog_size)
+            return static_cast<std::size_t>(index);
+    } catch (const std::exception &) {
+    }
+    return std::nullopt;
+}
+
+int optional_temperature(const boost::property_tree::ptree &section, const char *key)
+{
+    return section.get_optional<int>(key).value_or(0);
 }
 
 } // namespace
@@ -178,6 +198,100 @@ std::optional<std::string> make_filament_preset_id(const std::string &box_id, in
     if (box_id.empty() || vendor_index < 0 || filament_index <= 0)
         return std::nullopt;
     return "QD_" + box_id + "_" + std::to_string(vendor_index) + "_" + std::to_string(filament_index);
+}
+
+FilamentCatalogResult parse_packaged_filament_catalog(std::istream &input, std::size_t catalog_size)
+{
+    FilamentCatalogResult result;
+    result.entries.resize(catalog_size);
+    if (catalog_size == 0) {
+        result.diagnostics.emplace_back("packaged filament catalog has no addressable entries");
+        return result;
+    }
+
+    boost::property_tree::ptree tree;
+    try {
+        boost::property_tree::ini_parser::read_ini(input, tree);
+    } catch (const std::exception &error) {
+        result.diagnostics.emplace_back(std::string{"packaged filament catalog could not be parsed: "} + error.what());
+        return result;
+    }
+
+    std::size_t material_count = 0;
+    std::size_t colour_count = 0;
+    std::size_t vendor_count = 0;
+    for (const auto &section : tree) {
+        if (section.first == "colordict" || section.first == "vendor_list") {
+            for (const auto &item : section.second) {
+                const auto index = parse_catalog_index(item.first, result.entries.size());
+                if (!index) {
+                    result.diagnostics.emplace_back("ignored out-of-range " + section.first + " index " + item.first);
+                    continue;
+                }
+
+                if (section.first == "colordict") {
+                    const auto colour = normalize_colour(item.second.get_value<std::string>());
+                    if (!colour) {
+                        result.diagnostics.emplace_back("ignored invalid colour at index " + item.first);
+                        continue;
+                    }
+                    result.entries[*index].colour = *colour;
+                    ++colour_count;
+                } else {
+                    const std::string vendor = item.second.get_value<std::string>();
+                    if (vendor.empty()) {
+                        result.diagnostics.emplace_back("ignored empty vendor at index " + item.first);
+                        continue;
+                    }
+                    result.entries[*index].vendor = vendor;
+                    ++vendor_count;
+                }
+            }
+            continue;
+        }
+
+        if (section.first.rfind("fila", 0) != 0)
+            continue;
+        const auto index = parse_catalog_index(section.first.substr(4), result.entries.size());
+        if (!index) {
+            result.diagnostics.emplace_back("ignored out-of-range filament section " + section.first);
+            continue;
+        }
+
+        const std::string name = section.second.get<std::string>("filament", "");
+        const std::string type = section.second.get<std::string>("type", "");
+        if (name.empty() && type.empty())
+            continue;
+        if (name.empty() || type.empty()) {
+            result.diagnostics.emplace_back("ignored incomplete filament section " + section.first);
+            continue;
+        }
+
+        auto &entry = result.entries[*index];
+        entry.name = name;
+        entry.type = type;
+        entry.min_temperature = optional_temperature(section.second, "min_temp");
+        entry.max_temperature = optional_temperature(section.second, "max_temp");
+        entry.box_min_temperature = optional_temperature(section.second, "box_min_temp");
+        entry.box_max_temperature = optional_temperature(section.second, "box_max_temp");
+        ++material_count;
+    }
+
+    result.usable = material_count > 0 && colour_count > 0 && vendor_count > 0;
+    if (!result.usable)
+        result.diagnostics.emplace_back("packaged filament catalog omitted material, colour, or vendor data");
+    return result;
+}
+
+FilamentCatalogResult load_packaged_filament_catalog(const std::string &path, std::size_t catalog_size)
+{
+    std::ifstream input(path);
+    if (!input) {
+        FilamentCatalogResult result;
+        result.diagnostics.emplace_back("packaged filament catalog could not be opened");
+        return result;
+    }
+    return parse_packaged_filament_catalog(input, catalog_size);
 }
 
 CompatibilityResult resolve_compatibility(const PrinterMetadata &metadata,
