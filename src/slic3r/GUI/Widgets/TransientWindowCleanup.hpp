@@ -35,6 +35,24 @@ inline bool dismiss_transient_popup(wxPopupTransientWindow *popup)
     return true;
 }
 
+// On macOS, dismissing a native transient window from the mouse-down callback
+// that selected an item can leave its Cocoa surface composited after wxWidgets
+// considers the popup hidden. When the selection was posted to the owner, let
+// that queued handler dismiss the popup on the next event-loop turn. Other
+// platforms retain their existing immediate-dismiss behaviour, and a failed
+// post still closes the popup everywhere.
+inline bool dismiss_transient_after_selection(wxPopupTransientWindow *popup,
+                                              bool selection_event_posted)
+{
+#ifdef __APPLE__
+    if (selection_event_posted)
+        return false;
+#else
+    (void) selection_event_posted;
+#endif
+    return dismiss_transient_popup(popup);
+}
+
 inline void dismiss_transient_windows(std::initializer_list<wxPopupTransientWindow *> popups)
 {
     for (wxPopupTransientWindow *popup : popups)

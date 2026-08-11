@@ -1210,8 +1210,7 @@ void AmsMapingPopup::on_left_down(wxMouseEvent &evt)
                 (m_show_type == ShowType::RIGHT && item->GetParent()->GetName() == "right") ||
                 m_show_type == ShowType::LEFT_AND_RIGHT ||
                 m_show_type == ShowType::LEFT_AND_RIGHT_DYNAMIC) {
-                item->send_event(m_current_filament_id);
-                Dismiss();
+                dismiss_transient_after_selection(this, item->send_event(m_current_filament_id));
                 evt.StopPropagation();
                 return;
             }
@@ -1379,7 +1378,7 @@ void AmsMapingPopup::update_flush_waste(MachineObject* obj)
 }
 
 
-void MappingItem::send_event(int fliament_id)
+bool MappingItem::send_event(int fliament_id)
 {
     wxCommandEvent event(EVT_SET_FINISH_MAPPING);
     event.SetInt(m_tray_data.id);
@@ -1388,10 +1387,12 @@ void MappingItem::send_event(int fliament_id)
        m_tray_data.ams_id, m_tray_data.slot_id);
     event.SetString(param);
 
-    if (send_win) {
+    if (send_win && !send_win->IsBeingDeleted()) {
         event.SetEventObject(send_win);
         wxPostEvent(send_win, event);
+        return true;
     }
+    return false;
 }
 
  void MappingItem::msw_rescale()

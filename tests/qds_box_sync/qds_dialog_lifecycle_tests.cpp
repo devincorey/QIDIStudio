@@ -241,6 +241,43 @@ bool run_transient_owner_refresh_cycle()
     return passed;
 }
 
+bool run_deferred_selection_dismissal_cycle()
+{
+    auto *dialog = new wxDialog(nullptr, wxID_ANY, "QDS deferred selection dismissal");
+    auto *popup = new wxPopupTransientWindow(dialog, wxBORDER_NONE);
+    popup->SetSize(wxSize(480, 165));
+    bool selection_handled = false;
+
+    dialog->Bind(wxEVT_BUTTON, [&](wxCommandEvent &) {
+        selection_handled = true;
+        popup->Dismiss();
+        Slic3r::GUI::ensure_transient_popup_hidden(popup);
+    });
+
+    bool passed = dialog->Show();
+    popup->Popup();
+    wxCommandEvent selection(wxEVT_BUTTON);
+    wxPostEvent(dialog, selection);
+    const bool dismissed_inside_mouse_handler =
+        Slic3r::GUI::dismiss_transient_after_selection(popup, true);
+    passed = passed && popup->IsShown() && !dismissed_inside_mouse_handler;
+
+    wxTheApp->ProcessPendingEvents();
+    passed = passed && selection_handled && !popup->IsShown();
+
+    // If no owner can receive the selection, the fallback must still close the
+    // popup instead of leaving an orphaned native window behind.
+    popup->Popup();
+    passed = passed && popup->IsShown() &&
+             Slic3r::GUI::dismiss_transient_after_selection(popup, false) &&
+             !popup->IsShown();
+
+    popup->Destroy();
+    dialog->Destroy();
+    wxTheApp->ProcessPendingEvents();
+    return passed;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -264,16 +301,18 @@ int main(int argc, char **argv)
     const bool nested_tooltip_destroy_passed = run_nested_tooltip_destroy_cycle();
     const bool transient_selection_cleanup_passed = run_transient_selection_cleanup_cycles();
     const bool transient_owner_refresh_passed = run_transient_owner_refresh_cycle();
+    const bool deferred_selection_dismissal_passed = run_deferred_selection_dismissal_cycle();
 
     wxTheApp->OnExit();
     wxEntryCleanup();
 
     if (!cancel_passed || !close_passed || !success_passed || !parent_hide_passed ||
         !heap_popup_destroy_passed || !nested_tooltip_destroy_passed ||
-        !transient_selection_cleanup_passed || !transient_owner_refresh_passed) {
+        !transient_selection_cleanup_passed || !transient_owner_refresh_passed ||
+        !deferred_selection_dismissal_passed) {
         std::cerr << "QDS dialog lifecycle cleanup failed\n";
         return 1;
     }
-    std::cout << "QDS dialog lifecycle cleanup passed for cancel, window-close, success, parent-hide, nested-tooltip, transient-selection, and owner-refresh paths\n";
+    std::cout << "QDS dialog lifecycle cleanup passed for cancel, window-close, success, parent-hide, nested-tooltip, transient-selection, owner-refresh, and deferred-selection paths\n";
     return 0;
 }
