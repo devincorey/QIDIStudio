@@ -15,12 +15,23 @@ inline bool can_show_transient_child(const wxWindow *owner)
     return owner && owner->IsShown() && !owner->IsBeingDeleted();
 }
 
+inline bool ensure_transient_popup_hidden(wxPopupTransientWindow *popup)
+{
+    if (!popup)
+        return false;
+
+    if (popup->IsShown())
+        popup->Show(false);
+    return !popup->IsShown();
+}
+
 inline bool dismiss_transient_popup(wxPopupTransientWindow *popup)
 {
     if (!popup || !popup->IsShown())
         return false;
 
     popup->Dismiss();
+    ensure_transient_popup_hidden(popup);
     return true;
 }
 
@@ -28,6 +39,17 @@ inline void dismiss_transient_windows(std::initializer_list<wxPopupTransientWind
 {
     for (wxPopupTransientWindow *popup : popups)
         dismiss_transient_popup(popup);
+}
+
+inline bool refresh_transient_owner(wxWeakRef<wxWindow> owner)
+{
+    wxWindow *window = owner.get();
+    if (!window || window->IsBeingDeleted())
+        return false;
+
+    window->Refresh(true);
+    window->Update();
+    return true;
 }
 
 // Transient popups often highlight the control that opened them. Store that

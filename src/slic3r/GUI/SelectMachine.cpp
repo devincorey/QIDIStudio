@@ -4496,6 +4496,11 @@ void SelectMachineDialog::restore_qds_mapping_preferences()
 
 void SelectMachineDialog::on_set_finish_mapping(wxCommandEvent &evt)
 {
+    // The slot click posts this event after the native popup begins dismissal.
+    // Dismiss again here so every success and rejection path clears Cocoa's
+    // transient selection and invalidates the owner window.
+    m_mapping_popup.Dismiss();
+
     auto selection_data = evt.GetString();
     auto selection_data_arr = wxSplit(selection_data.ToStdString(), '|');
 
@@ -6148,23 +6153,9 @@ void SelectMachineDialog::on_material_item_clicked(MaterialItem* item,
     if (!has_box_machine)
         return;
 
-    MaterialHash::iterator iter = m_materialList.begin();
-    while (iter != m_materialList.end()) {
-        int           id = iter->first;
-        Material* item = iter->second;
-        MaterialItem* m = item->item;
-        m->on_normal();
-        iter++;
-    }
-
-    m_current_filament_id = used_filament_idx;
-    item->on_selected();
-
-    auto    mouse_pos = ClientToScreen(e.GetPosition());
-    wxPoint rect = item->ClientToScreen(wxPoint(0, 0));
-
+    (void) e;
     if (m_mapping_popup.IsShown())
-        return;
+        m_mapping_popup.Dismiss();
     if (used_filament_idx < 0 || static_cast<size_t>(used_filament_idx) >= preset_fila_infos.size()) {
         BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": slicing filament index is out of range";
         return;
@@ -6193,6 +6184,11 @@ void SelectMachineDialog::on_material_item_clicked(MaterialItem* item,
         }
     }
 
+    for (auto &entry : m_materialList)
+        entry.second->item->on_normal();
+
+    m_current_filament_id = used_filament_idx;
+    item->on_selected();
     m_mapping_popup.set_parent_item(item);
     m_mapping_popup.set_current_filament_id(used_filament_idx);
     m_mapping_popup.set_tag_texture(preset_fila_infos[used_filament_idx].filament_type);

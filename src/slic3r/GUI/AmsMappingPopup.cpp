@@ -1212,7 +1212,8 @@ void AmsMapingPopup::on_left_down(wxMouseEvent &evt)
                 m_show_type == ShowType::LEFT_AND_RIGHT_DYNAMIC) {
                 item->send_event(m_current_filament_id);
                 Dismiss();
-                break;
+                evt.StopPropagation();
+                return;
             }
         }
     }
@@ -1282,10 +1283,24 @@ void AmsMapingPopup::destroy_tip_popup()
 
 void AmsMapingPopup::Dismiss()
 {
+    const bool was_shown = IsShown();
+    wxWeakRef<wxWindow> owner(GetParent());
     clear_parent_item_selection();
     PopupWindow::Dismiss();
 #ifdef __APPLE__
+    // wxPopupTransientWindow::Dismiss() is normally synchronous, but Cocoa
+    // can leave the native popup surface visible until another event arrives.
+    // Explicitly hide any surviving surface before repainting the dialog.
+    ensure_transient_popup_hidden(this);
     destroy_tip_popup();
+    // Cocoa may leave the native popup border composited after its contents
+    // disappear. Repaint the owning dialog on the next event-loop turn, after
+    // wxPopupTransientWindow has completed native dismissal.
+    if (was_shown && wxTheApp) {
+        wxTheApp->CallAfter([owner]() {
+            refresh_transient_owner(owner);
+        });
+    }
 #endif
 }
 
