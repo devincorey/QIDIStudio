@@ -5214,6 +5214,14 @@ void Sidebar::sync_box_list(bool is_from_big_sync_btn)
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": selected device box count=" << box_state.snapshot_input.box_count
                                 << " snapshot_ready=" << box_state.ready;
 
+        if (!box_state.ready) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": selected QDS Box data is not ready for synchronization";
+            MessageDialog dlg(this, _L("The printer is connected, but its Box filament data is not available yet. Please wait for the Device page to finish updating and try again."),
+                              _L("Sync filaments with BOX"), wxOK);
+            dlg.ShowModal();
+            return;
+        }
+
         if (!qdsdev->upBoxInfoToBoxMsg(obj)) {
             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": selected QDS printer is incompatible with the active profile";
             MessageDialog dlg(this, _L("The connected printer metadata is incompatible with the selected printer profile."),

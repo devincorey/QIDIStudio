@@ -1,5 +1,7 @@
 #include <catch_main.hpp>
 
+#include <sstream>
+
 #include "slic3r/GUI/DeviceCore/QDSBoxSync.hpp"
 #include "libslic3r/ProjectTask.hpp"
 #include "libslic3r/ResultFilePath.hpp"
@@ -60,6 +62,52 @@ MappingSelection external_selection(const std::string &colour)
 }
 
 } // namespace
+
+TEST_CASE("packaged QIDI catalog restores the X-Plus 4 Box indexes", "[qds_box_sync][catalog][fallback]")
+{
+    const std::string path = std::string{TEST_DATA_DIR} + "/../../resources/profiles/officiall_filas_list.cfg";
+    const auto catalog = load_packaged_filament_catalog(path);
+
+    REQUIRE(catalog.usable);
+    REQUIRE(catalog.entries.size() == 100);
+    REQUIRE(catalog.entries[7].name == "PLA Basic");
+    REQUIRE(catalog.entries[7].type == "PLA");
+    REQUIRE(catalog.entries[1].vendor == "QIDI");
+    REQUIRE(catalog.entries[9].colour == "#228332");
+    REQUIRE(catalog.entries[18].colour == "#FF362D");
+    REQUIRE(catalog.entries[8].colour == "#DFD628");
+    REQUIRE(catalog.entries[1].colour == "#FAFAFA");
+}
+
+TEST_CASE("packaged catalog parser rejects malformed and incomplete data safely", "[qds_box_sync][catalog][bounds]")
+{
+    std::istringstream malformed{
+        "[fila7]\n"
+        "filament=PLA Basic\n"
+        "type=PLA\n"
+        "[fila100]\n"
+        "filament=Out of range\n"
+        "type=PLA\n"
+        "[colordict]\n"
+        "9=#228332\n"
+        "100=#FFFFFF\n"
+        "[vendor_list]\n"
+        "1=QIDI\n"};
+    const auto catalog = parse_packaged_filament_catalog(malformed, 100);
+
+    REQUIRE(catalog.usable);
+    REQUIRE(catalog.entries[7].name == "PLA Basic");
+    REQUIRE(catalog.entries[9].colour == "#228332");
+    REQUIRE(catalog.entries[1].vendor == "QIDI");
+    REQUIRE_FALSE(catalog.diagnostics.empty());
+
+    std::istringstream incomplete{
+        "[fila7]\n"
+        "filament=PLA Basic\n"
+        "type=PLA\n"};
+    REQUIRE_FALSE(parse_packaged_filament_catalog(incomplete).usable);
+    REQUIRE_FALSE(load_packaged_filament_catalog("/path/that/does/not/exist").usable);
+}
 
 TEST_CASE("selected Plus 4 profile supplies missing connected metadata", "[qds_box_sync][compatibility]")
 {

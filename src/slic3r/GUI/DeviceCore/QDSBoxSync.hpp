@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <cstddef>
+#include <iosfwd>
 #include <map>
 #include <optional>
 #include <string>
@@ -35,6 +36,25 @@ struct CompatibilityResult
     bool        used_selected_model_fallback{false};
     bool        used_selected_nozzle_fallback{false};
     std::string reason;
+};
+
+struct FilamentCatalogEntry
+{
+    std::string name;
+    std::string type;
+    std::string vendor;
+    std::string colour;
+    int         min_temperature{0};
+    int         max_temperature{0};
+    int         box_min_temperature{0};
+    int         box_max_temperature{0};
+};
+
+struct FilamentCatalogResult
+{
+    std::vector<FilamentCatalogEntry> entries;
+    std::vector<std::string>          diagnostics;
+    bool                              usable{false};
 };
 
 struct RawSlot
@@ -162,6 +182,10 @@ bool prefer_filament_match(bool candidate_exact, double candidate_colour_distanc
                            bool current_exact, double current_colour_distance);
 std::optional<std::string> normalize_colour(const std::optional<std::string> &colour);
 std::optional<std::string> make_filament_preset_id(const std::string &box_id, int vendor_index, int filament_index);
+FilamentCatalogResult parse_packaged_filament_catalog(std::istream &input,
+                                                       std::size_t catalog_size = 100);
+FilamentCatalogResult load_packaged_filament_catalog(const std::string &path,
+                                                      std::size_t catalog_size = 100);
 
 CompatibilityResult resolve_compatibility(const PrinterMetadata &metadata,
                                           const std::string &selected_model,

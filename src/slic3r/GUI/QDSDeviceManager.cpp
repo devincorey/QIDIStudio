@@ -647,6 +647,30 @@ QDSDevice::QDSDevice(const std::string dev_id, const std::string& dev_name, cons
     : m_id(dev_id), m_name(dev_name), m_ip(dev_ip), m_type(dev_type)
     , m_boxData(17), m_boxTemperature(4, 0.0), m_boxHumidity(4, 0)
 {
+    const std::string packaged_catalog_path = Slic3r::resources_dir() + "/profiles/officiall_filas_list.cfg";
+    const auto packaged_catalog = QDSBoxSync::load_packaged_filament_catalog(packaged_catalog_path);
+    for (const std::string &diagnostic : packaged_catalog.diagnostics)
+        BOOST_LOG_TRIVIAL(warning) << "QDS packaged filament catalog: " << diagnostic;
+    if (packaged_catalog.usable) {
+        m_filamentConfig.reserve(packaged_catalog.entries.size());
+        for (const auto &source : packaged_catalog.entries) {
+            Filament target;
+            target.name = source.name;
+            target.type = source.type;
+            target.vendor = source.vendor;
+            target.colorHexCode = source.colour;
+            target.minTemp = source.min_temperature;
+            target.maxTemp = source.max_temperature;
+            target.boxMinTemp = source.box_min_temperature;
+            target.boxMaxTemp = source.box_max_temperature;
+            m_filamentConfig.emplace_back(std::move(target));
+        }
+        BOOST_LOG_TRIVIAL(info) << "QDSDevice: loaded packaged filament catalog fallback with "
+                                << m_filamentConfig.size() << " addressable entries";
+    } else {
+        BOOST_LOG_TRIVIAL(error) << "QDSDevice: packaged filament catalog fallback is unavailable";
+    }
+
     //y79
     m_url = "ws://" + dev_url + ":7125/websocket";
 
