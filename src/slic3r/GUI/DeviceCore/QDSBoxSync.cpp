@@ -306,7 +306,17 @@ CompatibilityResult resolve_compatibility(const PrinterMetadata &metadata,
         result.reason = "selected printer profile is incomplete";
         return result;
     }
-    const bool supported_fallback = selected == "xplus4" && std::fabs(selected_nozzle - 0.4) <= nozzle_tolerance;
+    // The Plus 4 firmware currently omits model and nozzle metadata from its
+    // Box snapshot.  In that case the selected Plus 4 machine profile is the
+    // only available source of nozzle information.  Accept each nozzle size
+    // that QIDI ships a Plus 4 profile for, while continuing to reject an
+    // unsupported diameter or any contradictory connected metadata below.
+    static constexpr std::array<double, 4> supported_plus4_nozzles{0.2, 0.4, 0.6, 0.8};
+    const bool supported_fallback = selected == "xplus4" &&
+        std::any_of(supported_plus4_nozzles.begin(), supported_plus4_nozzles.end(),
+                    [selected_nozzle, nozzle_tolerance](double nozzle) {
+                        return std::fabs(selected_nozzle - nozzle) <= nozzle_tolerance;
+                    });
 
     const std::string configured = metadata.configured_model ?
         normalize_model_name(*metadata.configured_model) : std::string{};
@@ -327,7 +337,7 @@ CompatibilityResult resolve_compatibility(const PrinterMetadata &metadata,
         }
     }
     if (!has_reported_model && !supported_fallback) {
-        result.reason = "missing model metadata fallback is limited to the X-Plus 4 0.4 mm profile";
+        result.reason = "missing model metadata fallback requires a supported X-Plus 4 nozzle profile";
         return result;
     }
 
@@ -336,7 +346,7 @@ CompatibilityResult resolve_compatibility(const PrinterMetadata &metadata,
 
     if (!metadata.reported_nozzles) {
         if (!supported_fallback) {
-            result.reason = "missing nozzle metadata fallback is limited to the X-Plus 4 0.4 mm profile";
+            result.reason = "missing nozzle metadata fallback requires a supported X-Plus 4 nozzle profile";
             return result;
         }
         result.effective_nozzle = selected_nozzle;

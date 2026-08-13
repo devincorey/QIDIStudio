@@ -110,14 +110,16 @@ TEST_CASE("packaged catalog parser rejects malformed and incomplete data safely"
     REQUIRE_FALSE(load_packaged_filament_catalog("/path/that/does/not/exist").usable);
 }
 
-TEST_CASE("selected Plus 4 profile supplies missing connected metadata", "[qds_box_sync][compatibility]")
+TEST_CASE("selected Plus 4 nozzle profiles supply missing connected metadata", "[qds_box_sync][compatibility]")
 {
-    PrinterMetadata metadata;
-    const auto result = resolve_compatibility(metadata, "X-Plus 4", 0.4);
-    REQUIRE(result.compatible);
-    REQUIRE(result.used_selected_model_fallback);
-    REQUIRE(result.used_selected_nozzle_fallback);
-    REQUIRE(result.effective_nozzle == Approx(0.4));
+    for (const double nozzle : {0.2, 0.4, 0.6, 0.8}) {
+        INFO("nozzle=" << nozzle);
+        const auto result = resolve_compatibility({}, "X-Plus 4", nozzle);
+        REQUIRE(result.compatible);
+        REQUIRE(result.used_selected_model_fallback);
+        REQUIRE(result.used_selected_nozzle_fallback);
+        REQUIRE(result.effective_nozzle == Approx(nozzle));
+    }
 }
 
 TEST_CASE("equivalent Plus 4 spelling and reported 0.4 nozzle are accepted", "[qds_box_sync][compatibility]")
@@ -169,14 +171,17 @@ TEST_CASE("a fresh connection can fall back after an earlier contradictory nozzl
     REQUIRE(result.used_selected_nozzle_fallback);
 }
 
-TEST_CASE("missing metadata fallback is narrowly limited to Plus 4 at 0.4 mm", "[qds_box_sync][compatibility]")
+TEST_CASE("missing metadata fallback is limited to supported Plus 4 nozzle profiles", "[qds_box_sync][compatibility]")
 {
     REQUIRE_FALSE(resolve_compatibility({}, "X-Max 4", 0.4).compatible);
-    REQUIRE_FALSE(resolve_compatibility({}, "X-Plus 4", 0.6).compatible);
+    REQUIRE_FALSE(resolve_compatibility({}, "X-Plus 4", 0.3).compatible);
 
     PrinterMetadata plus4_without_nozzle;
     plus4_without_nozzle.configured_model = "X-Plus 4";
-    REQUIRE_FALSE(resolve_compatibility(plus4_without_nozzle, "X-Plus 4", 0.6).compatible);
+    const auto supported = resolve_compatibility(plus4_without_nozzle, "X-Plus 4", 0.6);
+    REQUIRE(supported.compatible);
+    REQUIRE(supported.used_selected_model_fallback);
+    REQUIRE(supported.used_selected_nozzle_fallback);
 }
 
 TEST_CASE("one Box normalizes all four QIDI PLA Basic slots exactly", "[qds_box_sync][snapshot]")
