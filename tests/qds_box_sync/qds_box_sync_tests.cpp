@@ -5,6 +5,7 @@
 #include "slic3r/GUI/DeviceCore/QDSBoxSync.hpp"
 #include "slic3r/GUI/DeviceCore/QDSPrintOptions.hpp"
 #include "libslic3r/ProjectTask.hpp"
+#include "libslic3r/QidiBoxFilament.hpp"
 #include "libslic3r/ResultFilePath.hpp"
 
 using namespace Slic3r::GUI::QDSBoxSync;
@@ -20,6 +21,20 @@ RawSlot qidi_basic(int slot, const std::string &colour)
     raw.vendor_index    = 1;
     raw.filament_index  = 7;
     raw.material_name   = "PLA Basic";
+    raw.material_type   = "PLA";
+    raw.colour          = colour;
+    return raw;
+}
+
+RawSlot generic_pla_matte(int slot, const std::string &colour)
+{
+    RawSlot raw;
+    raw.slot_index      = slot;
+    raw.occupied        = true;
+    raw.occupancy_known = true;
+    raw.vendor_index    = 0;
+    raw.filament_index  = 2;
+    raw.material_name   = "PLA Matte";
     raw.material_type   = "PLA";
     raw.colour          = colour;
     return raw;
@@ -690,6 +705,171 @@ TEST_CASE("exact QIDI identity is required before colour chooses among equivalen
     REQUIRE(prefer_filament_match(true, 5.0, true, 20.0));
     REQUIRE_FALSE(prefer_filament_match(true, 20.0, true, 5.0));
     REQUIRE_FALSE(prefer_filament_match(false, 1.0, true, 120.0));
+}
+
+TEST_CASE("Box filament identifiers distinguish Generic from branded materials",
+          "[qds_box_sync][identity]")
+{
+    using Slic3r::QidiBoxFilament::IdentityKind;
+    using Slic3r::QidiBoxFilament::classify;
+
+    const auto generic = classify("QD_0_0_2");
+    REQUIRE(generic.kind == IdentityKind::Generic);
+    REQUIRE(generic.box_index == 0);
+    REQUIRE(generic.vendor_index == 0);
+    REQUIRE(generic.filament_index == 2);
+
+    REQUIRE(classify("QD_0_1_2").kind == IdentityKind::Branded);
+    REQUIRE(classify("QD_3_17_42").kind == IdentityKind::Branded);
+    REQUIRE(classify("GFL99").kind == IdentityKind::NotBox);
+    REQUIRE(classify("QD_0_x_2").kind == IdentityKind::Malformed);
+    REQUIRE(classify("QD_0_0_2_extra").kind == IdentityKind::Malformed);
+    REQUIRE(classify("QD_-1_0_2").kind == IdentityKind::Malformed);
+    REQUIRE(classify("QD_0_0_0").kind == IdentityKind::Malformed);
+}
+
+TEST_CASE("Generic Box identity retains compatible custom presets without crossing material families",
+          "[qds_box_sync][identity][mapping]")
+{
+    using Slic3r::QidiBoxFilament::can_use_for_generic_slot;
+    using Slic3r::QidiBoxFilament::is_generic_system_candidate;
+
+    REQUIRE(qidi_filament_ids_compatible("GFL99", "QD_0_0_2"));
+    REQUIRE(qidi_filament_ids_compatible("", "QD_0_0_2"));
+    REQUIRE(qidi_filament_ids_compatible("QD_0_0_7", "QD_0_0_2"));
+    REQUIRE_FALSE(qidi_filament_ids_compatible("QD_0_1_2", "QD_0_0_2"));
+
+    REQUIRE(filament_selection_compatible(" PLA ", "GFL99", "pla", "QD_0_0_2", true));
+    REQUIRE(filament_selection_compatible("PLA", "GFL99", "PLA", "QD_0_0_2", false));
+    REQUIRE_FALSE(filament_selection_compatible("PETG", "GFL99", "PLA", "QD_0_0_2", true));
+    REQUIRE_FALSE(filament_selection_compatible("PETG", "GFL99", "PLA", "QD_0_0_2", false));
+
+    REQUIRE(can_use_for_generic_slot("GFL99", "PLA", "PLA"));
+    REQUIRE_FALSE(can_use_for_generic_slot("GFL99", "PETG", "PLA"));
+    REQUIRE_FALSE(can_use_for_generic_slot("QD_0_1_2", "PLA", "PLA"));
+    REQUIRE(is_generic_system_candidate("Generic PLA+ @Qidi X-Plus 4 0.4 nozzle",
+                                        "GFSL99", "PLA", "PLA"));
+    REQUIRE_FALSE(is_generic_system_candidate("QIDI PLA Rapido Matte @Qidi X-Plus 4 0.4 nozzle",
+                                              "QD_0_1_2", "PLA", "PLA"));
+}
+
+TEST_CASE("shared Box preset policy retains custom Generic profiles and exact-matches branded profiles",
+          "[qds_box_sync][identity][preset-policy]")
+{
+    using namespace Slic3r::QidiBoxFilament;
+    const std::vector<PresetCandidate> candidates{
+        {"3DPC Matte PLA+ @Qidi X-Plus 4 0.4 nozzle", "GFL99", "PLA", true, false, false},
+        {"Generic PLA @Qidi X-Plus 4 0.4 nozzle", "GFSL05", "PLA", true, true, true},
+        {"Generic PETG @Qidi X-Plus 4 0.4 nozzle", "GFSL06", "PETG", true, true, true},
+        {"QIDI PLA Rapido Matte @Qidi X-Plus 4 0.4 nozzle", "QD_0_1_2", "PLA", true, true, true},
+        {"QIDI PLA Basic @Qidi X-Plus 4 0.4 nozzle", "QD_0_1_7", "PLA", true, true, true}
+    };
+
+    const Resolution retained = resolve_preset({"QD_0_0_2", "PLA", 0}, candidates);
+    REQUIRE(retained.kind == ResolutionKind::RetainedProject);
+    REQUIRE(candidates[retained.candidate_index].name ==
+            "3DPC Matte PLA+ @Qidi X-Plus 4 0.4 nozzle");
+
+    const Resolution generic_fallback = resolve_preset({"QD_0_0_2", "PLA", 2}, candidates);
+    REQUIRE(generic_fallback.kind == ResolutionKind::GenericSystem);
+    REQUIRE(candidates[generic_fallback.candidate_index].name ==
+            "Generic PLA @Qidi X-Plus 4 0.4 nozzle");
+
+    const Resolution rapido = resolve_preset({"QD_0_1_2", "PLA", 0}, candidates);
+    REQUIRE(rapido.kind == ResolutionKind::BrandedExact);
+    REQUIRE(candidates[rapido.candidate_index].name ==
+            "QIDI PLA Rapido Matte @Qidi X-Plus 4 0.4 nozzle");
+
+    const Resolution basic = resolve_preset({"QD_0_1_7", "PLA", 0}, candidates);
+    REQUIRE(basic.kind == ResolutionKind::BrandedExact);
+    REQUIRE(candidates[basic.candidate_index].name ==
+            "QIDI PLA Basic @Qidi X-Plus 4 0.4 nozzle");
+
+    REQUIRE_FALSE(resolve_preset({"QD_0_1_9", "PLA", 0}, candidates));
+    REQUIRE_FALSE(resolve_preset({"QD_0_bad_2", "PLA", 0}, candidates));
+}
+
+TEST_CASE("Box preset planning is atomic when any slot cannot resolve",
+          "[qds_box_sync][identity][preset-policy][atomic]")
+{
+    using namespace Slic3r::QidiBoxFilament;
+    const std::vector<PresetCandidate> candidates{
+        {"Custom PLA", "GFL99", "PLA", true, false, false},
+        {"Generic PLA", "GFSL05", "PLA", true, true, true},
+        {"QIDI PLA Basic", "QD_0_1_7", "PLA", true, true, true}
+    };
+
+    const std::vector<SlotRequest> valid{
+        {"QD_0_0_2", "PLA", 0},
+        {"QD_0_1_7", "PLA", std::nullopt}
+    };
+    const auto valid_plan = resolve_all(valid, candidates);
+    REQUIRE(valid_plan);
+    REQUIRE(valid_plan->size() == 2);
+    REQUIRE((*valid_plan)[0].kind == ResolutionKind::RetainedProject);
+    REQUIRE((*valid_plan)[1].kind == ResolutionKind::BrandedExact);
+
+    const std::vector<SlotRequest> invalid{
+        {"QD_0_0_2", "PLA", 0},
+        {"QD_0_1_2", "PLA", std::nullopt}
+    };
+    REQUIRE_FALSE(resolve_all(invalid, candidates));
+}
+
+TEST_CASE("Generic Box mapping preserves slot identity order and colour",
+          "[qds_box_sync][identity][mapping][colour]")
+{
+    BoxSnapshotInput input;
+    input.box_count = 1;
+    input.box_id = "0";
+    input.slots = {
+        generic_pla_matte(0, "#228332"),
+        generic_pla_matte(1, "#FF362D"),
+        generic_pla_matte(2, "#DFD628"),
+        generic_pla_matte(3, "#FAFAFA")
+    };
+    const auto snapshot = normalize_snapshot(input);
+    REQUIRE(snapshot.slots.size() == 4);
+
+    const std::array<std::string, 4> colours{
+        "#228332", "#FF362D", "#DFD628", "#FAFAFA"
+    };
+    for (int slot_index = 0; slot_index < 4; ++slot_index) {
+        INFO("slot=" << slot_index);
+        REQUIRE(snapshot.slots[slot_index].slot_index == slot_index);
+        REQUIRE(snapshot.slots[slot_index].filament_preset_id == "QD_0_0_2");
+        REQUIRE(snapshot.slots[slot_index].material_name == "PLA Matte");
+        REQUIRE(snapshot.slots[slot_index].material_type == "PLA");
+        REQUIRE(snapshot.slots[slot_index].colour == colours[slot_index]);
+
+        MappingSelection selection;
+        selection.tray_id = slot_index;
+        selection.ams_id = "1";
+        selection.slot_id = std::to_string(slot_index);
+        selection.displayed_preset_id = "QD_0_0_2";
+        selection.displayed_material = "PLA";
+        selection.displayed_colour = colours[slot_index];
+        selection.project_preset_id = "GFL99";
+        selection.project_material = "PLA";
+
+        Slic3r::FilamentInfo mapping;
+        mapping.id = slot_index;
+        REQUIRE(apply_mapping_selection(mapping, snapshot, selection));
+        REQUIRE(mapping.tray_id == slot_index);
+        REQUIRE(mapping.filament_id == "QD_0_0_2");
+        REQUIRE(mapping.color == colours[slot_index].substr(1) + "FF");
+    }
+}
+
+TEST_CASE("branded Box identity requires exact matching for QIDI preset identifiers",
+          "[qds_box_sync][identity][mapping]")
+{
+    REQUIRE(qidi_filament_ids_compatible("QD_0_1_2", "QD_0_1_2"));
+    REQUIRE(qidi_filament_ids_compatible("GFL99", "QD_0_1_2"));
+    REQUIRE_FALSE(qidi_filament_ids_compatible("QD_0_1_7", "QD_0_1_2"));
+    REQUIRE_FALSE(qidi_filament_ids_compatible("QD_0_0_2", "QD_0_1_2"));
+    REQUIRE_FALSE(qidi_filament_ids_compatible("GFL99", "QD_0_bad_2"));
+    REQUIRE_FALSE(qidi_filament_ids_compatible("QD_0_1_2", "GFSL05"));
 }
 
 TEST_CASE("mapping preferences are scoped to printer, device, and project preset", "[qds_box_sync][mapping][persistence]")

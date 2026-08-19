@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include "libslic3r/ProjectTask.hpp"
+#include "libslic3r/QidiBoxFilament.hpp"
 #include "DevDefs.h"
 
 namespace Slic3r::GUI::QDSBoxSync {
@@ -147,7 +148,7 @@ bool valid_catalog_index(int index, std::size_t catalog_size)
 
 bool qidi_filament_ids_compatible(const std::string &project_preset_id, const std::string &slot_preset_id)
 {
-    return project_preset_id.rfind("QD_", 0) != 0 || project_preset_id == slot_preset_id;
+    return QidiBoxFilament::preset_ids_compatible(project_preset_id, slot_preset_id);
 }
 
 bool filament_selection_compatible(const std::string &project_material,
@@ -158,15 +159,10 @@ bool filament_selection_compatible(const std::string &project_material,
 {
     if (!qidi_filament_ids_compatible(project_preset_id, slot_preset_id))
         return false;
-    if (!enforce_material)
+    const auto slot_identity = QidiBoxFilament::classify(slot_preset_id);
+    if (!enforce_material && slot_identity.kind != QidiBoxFilament::IdentityKind::Generic)
         return true;
-
-    const auto lowercase = [](std::string value) {
-        std::transform(value.begin(), value.end(), value.begin(),
-                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-        return value;
-    };
-    return lowercase(project_material) == lowercase(slot_material);
+    return QidiBoxFilament::material_families_compatible(project_material, slot_material);
 }
 
 bool prefer_filament_match(bool candidate_exact, double candidate_colour_distance,
