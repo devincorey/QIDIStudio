@@ -35,6 +35,10 @@ The current `GeekCraft 02.07.02.60-gc.8` release has the following provenance:
 “Built on macOS 27 beta” describes the build environment. It does not mean
 macOS 27 is required to run the application.
 
+The default `main` branch tracks upstream source plus this fork landing page.
+Patched source for a packaged build lives on its matching `geekcraft/*` release
+branch and annotated release tag; use the source link above for `gc.8`.
+
 ## What this fork fixes
 
 The current build contains 16 reviewable commits grouped into 12 independently
@@ -174,7 +178,7 @@ upstream releases are first tested without these patches. A fix is removed only
 when its regression is demonstrably fixed upstream; retained patches are
 replayed individually and reviewed with source comparison and `git range-diff`.
 
-QIDI's public `v2.07.02.60` source archive does not include the proprietary
+QIDI's public `v2.07.02.60` source archive does not include the non-public
 `QIDINetwork` and `UserPresetSyncManager` sources used by QIDI's internal build.
 This fork's public build therefore targets the available direct-LAN QDS path and
 does not claim coverage of those unavailable components.
