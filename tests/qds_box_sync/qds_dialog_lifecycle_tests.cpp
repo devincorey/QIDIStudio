@@ -8,6 +8,7 @@
 #include <wx/weakref.h>
 
 #include "slic3r/GUI/DeviceCore/QDSModalClose.hpp"
+#include "slic3r/GUI/ProcessModeSwitchState.hpp"
 #include "slic3r/GUI/Widgets/TransientWindowCleanup.hpp"
 
 namespace {
@@ -278,6 +279,17 @@ bool run_deferred_selection_dismissal_cycle()
     return passed;
 }
 
+bool run_process_mode_switch_state_checks()
+{
+    const auto simple = Slic3r::GUI::process_mode_switch_state(false, false);
+    const auto advanced = Slic3r::GUI::process_mode_switch_state(true, false);
+    const auto develop = Slic3r::GUI::process_mode_switch_state(true, true);
+
+    return !simple.value && simple.enabled &&
+           advanced.value && advanced.enabled &&
+           develop.value && !develop.enabled;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -302,6 +314,7 @@ int main(int argc, char **argv)
     const bool transient_selection_cleanup_passed = run_transient_selection_cleanup_cycles();
     const bool transient_owner_refresh_passed = run_transient_owner_refresh_cycle();
     const bool deferred_selection_dismissal_passed = run_deferred_selection_dismissal_cycle();
+    const bool process_mode_switch_state_passed = run_process_mode_switch_state_checks();
 
     wxTheApp->OnExit();
     wxEntryCleanup();
@@ -309,10 +322,10 @@ int main(int argc, char **argv)
     if (!cancel_passed || !close_passed || !success_passed || !parent_hide_passed ||
         !heap_popup_destroy_passed || !nested_tooltip_destroy_passed ||
         !transient_selection_cleanup_passed || !transient_owner_refresh_passed ||
-        !deferred_selection_dismissal_passed) {
+        !deferred_selection_dismissal_passed || !process_mode_switch_state_passed) {
         std::cerr << "QDS dialog lifecycle cleanup failed\n";
         return 1;
     }
-    std::cout << "QDS dialog lifecycle cleanup passed for cancel, window-close, success, parent-hide, nested-tooltip, transient-selection, owner-refresh, and deferred-selection paths\n";
+    std::cout << "QDS dialog lifecycle cleanup and Process mode-state checks passed for cancel, window-close, success, parent-hide, nested-tooltip, transient-selection, owner-refresh, deferred-selection, and Develop-as-Advanced paths\n";
     return 0;
 }
