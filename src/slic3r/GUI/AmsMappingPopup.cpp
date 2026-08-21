@@ -1299,12 +1299,19 @@ void AmsMapingPopup::Dismiss()
 {
     const bool was_shown = IsShown();
     wxWeakRef<wxWindow> owner(GetParent());
+#ifdef __APPLE__
+    // Hide the Cocoa popup while wxWidgets still considers it shown. Calling
+    // Dismiss() first changes the wx state before a direct native hide can be
+    // requested, which can leave an empty popup surface composited over the
+    // print dialog. Do this before clearing and repainting the selected item.
+    if (was_shown)
+        ensure_transient_popup_hidden(this);
+#endif
     clear_parent_item_selection();
     PopupWindow::Dismiss();
 #ifdef __APPLE__
-    // wxPopupTransientWindow::Dismiss() is normally synchronous, but Cocoa
-    // can leave the native popup surface visible until another event arrives.
-    // Explicitly hide any surviving surface before repainting the dialog.
+    // Keep the post-dismiss check as a defensive fallback for alternate close
+    // paths, including parent-window teardown.
     ensure_transient_popup_hidden(this);
     destroy_tip_popup();
     // Cocoa may leave the native popup border composited after its contents
