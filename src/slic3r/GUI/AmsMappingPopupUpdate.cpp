@@ -20,6 +20,7 @@
 #include "Widgets/ProgressDialog.hpp"
 #include "Widgets/RoundedRectangle.hpp"
 #include "Widgets/StaticBox.hpp"
+#include "Widgets/TransientWindowCleanup.hpp"
 
 #include <wx/progdlg.h>
 #include <wx/clipbrd.h>
@@ -108,9 +109,9 @@ void AmsMapingPopup::update(MachineObject* obj,
         m_split_line_panel->Hide();
         m_right_marea_panel->Show();
         m_right_marea_panel->Enable(true);
-        m_right_extra_slot->Show();
-        m_right_extra_slot->Enable(true);
-        m_right_split_ext_sizer->Show(true);
+        m_right_extra_slot->Show(m_has_external_spool);
+        m_right_extra_slot->Enable(m_has_external_spool);
+        m_right_split_ext_sizer->Show(m_has_external_spool);
         set_sizer_title(m_right_split_ams_sizer, _L("BOX"));
     } else if (extruder_num > 1) {
         if (m_show_type == ShowType::LEFT_AND_RIGHT_DYNAMIC) {
@@ -238,6 +239,7 @@ static std::optional<TrayData> sGetTrayData(DevAmsTray* tray,
 //y80
 void AmsMapingPopup::update_mapping_items(MachineObject* obj, const std::vector<FilamentInfo>& ams_mapping_result, bool use_dynamic_switch, std::shared_ptr<QDSDevice> qds_obj, std::string dev_id)
 {
+    m_has_external_spool = false;
     std::list<MappingContainer*>   left_one_slot_containers;
     std::list<MappingContainer*>   right_one_slot_containers;
     std::vector<MappingContainer*> left_four_slots_containers;
@@ -347,23 +349,44 @@ void AmsMapingPopup::update_mapping_items(MachineObject* obj, const std::vector<
     std::vector<std::string> filament_id;
     std::vector<int> slot_id;
     std::vector<int> slot_state;
-    int box_count;
+    int box_count = 0;
+    QDSBoxSync::BoxSnapshot box_snapshot;
+    bool has_qds_snapshot = false;
     if(qds_obj != nullptr){
-        filament_colors = qds_obj->m_filament_colors;
-        filament_type = qds_obj->m_filament_type;
-        filament_id = qds_obj->m_filament_id;
-        slot_id = qds_obj->m_slot_id;
-        slot_state = qds_obj->m_slot_state;
-        box_count = qds_obj->m_box_count;
+        const auto box_state = qds_obj->getBoxMappingState();
+        if (!box_state.ready) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": QDS Box mapping state is not ready";
+            return;
+        }
+        filament_colors = box_state.filament_colors;
+        filament_type = box_state.filament_type;
+        filament_id = box_state.filament_id;
+        slot_id = box_state.slot_id;
+        slot_state = box_state.slot_state;
+        box_count = box_state.box_count;
+        box_snapshot = box_state.snapshot;
+        has_qds_snapshot = true;
 //y80
     } else if(!dev_id.empty()){
-        auto qds_device = GUI::wxGetApp().qdsdevmanager->getDevice(dev_id);
-        filament_colors = qds_device->m_filament_colors;
-        filament_type = qds_device->m_filament_type;
-        filament_id = qds_device->m_filament_id;
-        slot_id = qds_device->m_slot_id;
-        slot_state = qds_device->m_slot_state;
-        box_count = qds_device->m_box_count;
+        auto qds_manager = GUI::wxGetApp().qdsdevmanager;
+        auto qds_device = qds_manager ? qds_manager->getDevice(dev_id) : nullptr;
+        if (!qds_device) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": QDS device disappeared before mapping popup update";
+            return;
+        }
+        const auto box_state = qds_device->getBoxMappingState();
+        if (!box_state.ready) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": QDS Box mapping state is not ready";
+            return;
+        }
+        filament_colors = box_state.filament_colors;
+        filament_type = box_state.filament_type;
+        filament_id = box_state.filament_id;
+        slot_id = box_state.slot_id;
+        slot_state = box_state.slot_state;
+        box_count = box_state.box_count;
+        box_snapshot = box_state.snapshot;
+        has_qds_snapshot = true;
     }
     else {
         filament_colors = GUI::wxGetApp().plater()->box_msg.filament_colors;
@@ -375,68 +398,58 @@ void AmsMapingPopup::update_mapping_items(MachineObject* obj, const std::vector<
     }
 
 
-    for(int box_num = 0; box_num < box_count; box_num++){
-        for (int j = 0; j < 1; j++) {
+    const size_t aligned_size = std::min({filament_colors.size(), filament_type.size(), filament_id.size(), slot_id.size(), slot_state.size()});
+    box_count = std::clamp(box_count, 0, QDSBoxSync::max_box_count);
+    for (int box_num = 0; box_num < box_count; ++box_num) {
+        auto *sizer_mapping_list = new wxBoxSizer(wxHORIZONTAL);
+        auto *ams_mapping_item_container = new MappingContainer(m_right_marea_panel, "QIDI-BOX", 4);
+        ams_mapping_item_container->SetName(m_right_marea_panel->GetName());
+        ams_mapping_item_container->SetSizer(sizer_mapping_list);
+        ams_mapping_item_container->Layout();
 
-            int ams_indx = 0;
-            int nozzle_id = 0;
+        std::vector<TrayData> tray_datas;
+        for (int i = box_num * QDSBoxSync::slots_per_box; i < (box_num + 1) * QDSBoxSync::slots_per_box; ++i) {
+            TrayData td;
 
-            auto sizer_mapping_list = new wxBoxSizer(wxHORIZONTAL);
-            auto ams_mapping_item_container = new MappingContainer(nozzle_id == 0 ? m_right_marea_panel : m_left_marea_panel, "QIDI-BOX", 4);
-            ams_mapping_item_container->SetName(nozzle_id == 0 ? m_right_marea_panel->GetName() : m_left_marea_panel->GetName());
-            ams_mapping_item_container->SetSizer(sizer_mapping_list);
-            ams_mapping_item_container->Layout();
-
-            std::vector<TrayData>                      tray_datas;
-            for (int i = box_num * 4; i < (box_num + 1) * 4; i++) {
-                TrayData td;
-
-                td.id = i;
-
-                td.ams_id = box_num + 1;
-                if(slot_state[i])
-                    td.slot_id = slot_id[i];
-                else
-                    td.slot_id = VIRTUAL_TRAY_MAIN_ID;
-
-
-                td.type = NORMAL;
-                td.remain = 0;
-                std::string color = filament_colors[i];
-                td.colour = DevAmsTray::decode_color((color.erase(0, 1)) + "FF");
-                td.name = filament_type[i];
-                td.filament_type = filament_type[i];
-                td.ctype = TrayType::NORMAL;
-
-                tray_datas.push_back(td);
+            td.id     = i;
+            td.ams_id = box_num + 1;
+            const bool occupied = static_cast<size_t>(i) < aligned_size && slot_state[i] != 0 &&
+                                  slot_id[i] >= 0 && !filament_id[i].empty();
+            td.slot_id = occupied ? slot_id[i] : VIRTUAL_TRAY_MAIN_ID;
+            td.type    = occupied ? NORMAL : EMPTY;
+            td.remain  = 0;
+            const std::string colour = occupied ? QDSBoxSync::normalize_colour(filament_colors[i]).value_or("#CECECE") : "#CECECE";
+            td.colour        = DevAmsTray::decode_color(colour.substr(1) + "FF");
+            td.name          = occupied ? filament_type[i] : "";
+            td.filament_type = occupied ? filament_type[i] : "";
+            td.filament_preset_id = occupied ? filament_id[i] : "";
+            if (occupied && has_qds_snapshot) {
+                const auto snapshot_slot = std::find_if(box_snapshot.slots.begin(), box_snapshot.slots.end(),
+                                                        [i](const QDSBoxSync::BoxSlotSnapshot &slot) { return slot.slot_index == i; });
+                if (snapshot_slot != box_snapshot.slots.end() && snapshot_slot->material_name)
+                    td.name = *snapshot_slot->material_name;
             }
+            td.ctype = TrayType::NORMAL;
 
-            ams_mapping_item_container->Show();
-            add_ams_mapping(tray_datas, false, ams_mapping_item_container, sizer_mapping_list);
-            m_amsmapping_container_sizer_list.push_back(sizer_mapping_list);
-            m_amsmapping_container_list.push_back(ams_mapping_item_container);
-
-            if (nozzle_id == 0) {
-                if (ams_mapping_item_container->get_slots_num() == 1) {
-                    right_one_slot_containers.push_back(ams_mapping_item_container);
-                }
-                else {
-                    right_four_slot_containers.push_back(ams_mapping_item_container);
-                }
-            }
-            else if (nozzle_id == 1) {
-                if (ams_mapping_item_container->get_slots_num() == 1) {
-                    left_one_slot_containers.push_back(ams_mapping_item_container);
-                }
-                else {
-                    left_four_slots_containers.push_back(ams_mapping_item_container);
-                }
-            }
+            tray_datas.push_back(td);
         }
+
+        ams_mapping_item_container->Show();
+        add_ams_mapping(tray_datas, false, ams_mapping_item_container, sizer_mapping_list);
+        m_amsmapping_container_sizer_list.push_back(sizer_mapping_list);
+        m_amsmapping_container_list.push_back(ams_mapping_item_container);
+
+        if (ams_mapping_item_container->get_slots_num() == 1)
+            right_one_slot_containers.push_back(ams_mapping_item_container);
+        else
+            right_four_slot_containers.push_back(ams_mapping_item_container);
     }
 
-    //ext
-    {
+    // External spool is not displayed for an empty firmware placeholder.
+    const size_t external_index = static_cast<size_t>(QDSBoxSync::external_spool_slot);
+    m_has_external_spool = aligned_size > external_index && slot_state[external_index] != 0 &&
+                           slot_id[external_index] >= 0 && !filament_id[external_index].empty();
+    if (m_has_external_spool) {
         TrayData td;
 
         td.id = 0;
@@ -448,13 +461,17 @@ void AmsMapingPopup::update_mapping_items(MachineObject* obj, const std::vector<
 
         td.type = NORMAL;
         td.remain = 0;
-        std::string color = filament_colors.back();
-        td.colour = DevAmsTray::decode_color((color.erase(0, 1)) + "FF");
-        td.name = filament_type.back();
-        td.filament_type = filament_type.back();
+        const std::string colour = QDSBoxSync::normalize_colour(filament_colors[external_index]).value_or("#CECECE");
+        td.colour = DevAmsTray::decode_color(colour.substr(1) + "FF");
+        td.name = filament_type[external_index];
+        td.filament_type = filament_type[external_index];
+        td.filament_preset_id = filament_id[external_index];
         td.ctype = TrayType::NORMAL;
         m_right_extra_slot->send_win = send_win;
         add_ext_ams_mapping(td, m_right_extra_slot);
+    } else {
+        m_right_extra_slot->Hide();
+        m_right_split_ext_sizer->Show(false);
     }
 
 
@@ -657,7 +674,7 @@ void AmsMapingPopup::update_rack_select(MachineObject* obj, bool use_dynamic_swi
 void AmsMapingPopup::update_items_check_state(const std::vector<FilamentInfo>& ams_mapping_result)
 {
     /*update check states*/
-    if (m_parent_item) {
+    if (m_parent_item.get()) {
         auto update_item_check_state = [&ams_mapping_result, this](MappingItem* item) {
             if (item) {
                 for (const auto& mapping_res : ams_mapping_result) {
@@ -745,7 +762,7 @@ void AmsMapingPopup::add_ams_mapping(std::vector<TrayData> tray_data,
 
         // check filament type
         if (can_pick_the_item) {
-            if (tray_data[i].type == NORMAL && !is_match_material(tray_data[i].filament_type)){
+            if (tray_data[i].type == NORMAL && !is_match_filament(tray_data[i])){
                 can_pick_the_item = false;
             } else if(tray_data[i].type == EMPTY){
                 can_pick_the_item = false;
@@ -771,8 +788,7 @@ void AmsMapingPopup::add_ams_mapping(std::vector<TrayData> tray_data,
         m_mapping_item->set_data(m_tag_material, display_color, display_name, remain_detect_flag, tray_data[i], !can_pick_the_item, item_tooltip_msg);
         m_mapping_item->Bind(wxEVT_LEFT_DOWN, [this, can_pick_the_item, m_mapping_item](wxMouseEvent& e) {
             if (can_pick_the_item) {
-                m_mapping_item->send_event(m_current_filament_id);
-                Dismiss();
+                dismiss_transient_after_selection(this, m_mapping_item->send_event(m_current_filament_id));
             }
         });
 
@@ -789,40 +805,35 @@ void AmsMapingPopup::add_ext_ams_mapping(TrayData tray_data, MappingItem* item)
 #endif
     // set button
     if (tray_data.type == NORMAL) {
-        if (is_match_material(tray_data.filament_type)) {
+        if (is_match_filament(tray_data, m_ext_mapping_filatype_check)) {
             item->set_data(m_tag_material, tray_data.colour, tray_data.name, false, tray_data);
         } else {
             item->set_data(m_tag_material, m_ext_mapping_filatype_check ? wxColour(0xEE, 0xEE, 0xEE) : tray_data.colour, tray_data.name, false, tray_data, true);
             m_has_unmatch_filament = true;
         }
 
-        item->Bind(wxEVT_LEFT_DOWN, [this, tray_data, item](wxMouseEvent& e) {
-            if (!item->GetParent() || !item->GetParent()->IsEnabled()) return;
-            if (m_ext_mapping_filatype_check && !is_match_material(tray_data.filament_type)) return;
-            item->send_event(m_current_filament_id);
-            Dismiss();
-        });
     }
 
 
     // temp
     if (tray_data.type == EMPTY) {
         item->set_data(m_tag_material, wxColour(0xCE, 0xCE, 0xCE), "-", false, tray_data);
-        item->Bind(wxEVT_LEFT_DOWN, [this, tray_data, item](wxMouseEvent& e) {
-            if (!item->GetParent() || !item->GetParent()->IsEnabled()) return;
-            item->send_event(m_current_filament_id);
-            Dismiss();
-        });
     }
 
     // third party
     if (tray_data.type == THIRD) {
         item->set_data(m_tag_material, tray_data.colour, "?", false, tray_data);
         //item->set_data(wxColour(0xCE, 0xCE, 0xCE), "?", tray_data);
-        item->Bind(wxEVT_LEFT_DOWN, [this, tray_data, item](wxMouseEvent& e) {
-            if (!item->GetParent() || !item->GetParent()->IsEnabled()) return;
-            item->send_event(m_current_filament_id);
-            Dismiss();
+    }
+
+    if (m_bound_external_items.insert(item).second) {
+        item->Bind(wxEVT_LEFT_DOWN, [this, item](wxMouseEvent &) {
+            if (!item->GetParent() || !item->GetParent()->IsEnabled())
+                return;
+            if (item->m_tray_data.type == NORMAL &&
+                !is_match_filament(item->m_tray_data, m_ext_mapping_filatype_check))
+                return;
+            dismiss_transient_after_selection(this, item->send_event(m_current_filament_id));
         });
     }
 

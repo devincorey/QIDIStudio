@@ -12,6 +12,7 @@
 #include "MainFrame.hpp"
 #include "GUI_App.hpp"
 #include "Plater.hpp"
+#include "ProcessModeSwitchState.hpp"
 
 #include "Widgets/Label.hpp"
 #include "Widgets/SwitchButton.hpp"
@@ -672,28 +673,15 @@ bool ParamsPanel::is_active_and_shown_tab(wxPanel* tab)
 
 void ParamsPanel::update_mode()
 {
-    int app_mode = Slic3r::GUI::wxGetApp().get_mode();
+    const ConfigOptionMode app_mode = Slic3r::GUI::wxGetApp().get_mode();
     SwitchButton * mode_view = m_current_tab ? dynamic_cast<Tab*>(m_current_tab)->m_mode_view : nullptr;
     if (mode_view == nullptr) mode_view = m_mode_view;
     if (mode_view == nullptr) return;
 
-    //QDS: disable the mode tab and return directly when enable develop mode
-    if (app_mode == comDevelop)
-    {
-        mode_view->Disable();
-        return;
-    }
-    if (!mode_view->IsEnabled())
-        mode_view->Enable();
-
-    if (app_mode == comAdvanced)
-    {
-        mode_view->SetValue(true);
-    }
-    else
-    {
-        mode_view->SetValue(false);
-    }
+    const ProcessModeSwitchState state = process_mode_switch_state(
+        app_mode != comSimple, app_mode == comDevelop);
+    mode_view->SetValue(state.value);
+    mode_view->Enable(state.enabled);
 }
 
 void ParamsPanel::msw_rescale()

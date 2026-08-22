@@ -294,6 +294,7 @@ set(lisbslic3r_sources
     Preset.hpp
     PresetBundle.cpp
     PresetBundle.hpp
+    QidiBoxFilament.hpp
     ProjectTask.cpp
     ProjectTask.hpp
     PrincipalComponents2D.hpp
@@ -366,6 +367,7 @@ set(lisbslic3r_sources
     TriangulateWall.cpp
     utils.cpp
     Utils.hpp
+    ResultFilePath.hpp
     Time.cpp
     Time.hpp
     Timer.cpp

@@ -13,6 +13,7 @@
 #include "Widgets/ProgressDialog.hpp"
 #include "Widgets/RoundedRectangle.hpp"
 #include "Widgets/StaticBox.hpp"
+#include "Widgets/TransientWindowCleanup.hpp"
 
 #include <wx/progdlg.h>
 #include <wx/clipbrd.h>
@@ -57,6 +58,7 @@ const int LEFT_OFFSET = 2;
     m_rack_nozzle_bitmap = ScalableBitmap(this, "dev_rack_nozzle_print_job", 22);
 
     m_material_coloul = mcolour;
+    m_project_material_colour = mcolour;
     m_material_name = mname;
     m_ams_coloul      = wxColour(0xEE,0xEE,0xEE);
 
@@ -127,11 +129,25 @@ void MaterialItem::set_nozzle_info(const wxString& mapped_nozzle_str)
 }
 
 void MaterialItem::set_material_cols(int ctype, const std::vector<wxColour>& cols) {
-    if (m_material_ctype != ctype || m_material_cols != cols) {
-        m_material_ctype = ctype;
-        m_material_cols = cols;
-        Refresh();
-    }
+    m_project_material_ctype = ctype;
+    m_project_material_cols = cols;
+    set_material_display(m_project_material_colour, ctype, cols);
+}
+
+void MaterialItem::set_material_display(wxColour col, int ctype, const std::vector<wxColour>& cols)
+{
+    if (m_material_coloul == col && m_material_ctype == ctype && m_material_cols == cols)
+        return;
+
+    m_material_coloul = col;
+    m_material_ctype = ctype;
+    m_material_cols = cols;
+    Refresh();
+}
+
+void MaterialItem::restore_material_display()
+{
+    set_material_display(m_project_material_colour, m_project_material_ctype, m_project_material_cols);
 }
 
 void MaterialItem::reset_ams_info() {
@@ -975,16 +991,17 @@ AmsMapingPopup::AmsMapingPopup(wxWindow *parent, bool use_in_sync_dialog) :
      Fit();
 
      Bind(wxEVT_SHOW, [this](wxShowEvent& e) {
-         if (e.IsShown() && m_parent_item)
+         MaterialItem *parent_item = m_parent_item.get();
+         if (e.IsShown() && parent_item)
          {
-             auto show_pos = m_parent_item->ClientToScreen(wxPoint(0, 0));
-             int  display_idx = wxDisplay::GetFromWindow(m_parent_item);
+             auto show_pos = parent_item->ClientToScreen(wxPoint(0, 0));
+             int  display_idx = wxDisplay::GetFromWindow(parent_item);
 
              if (display_idx == wxNOT_FOUND)
                  display_idx = 0;
 
              wxRect screen_size = wxDisplay(display_idx).GetClientArea();
-             auto   parent_size = m_parent_item->GetRect();
+             auto   parent_size = parent_item->GetRect();
              auto   content_size = m_sizer_main_h->GetMinSize();
              int    popup_width  = content_size.x + FromDIP(28);
              int    popup_height = content_size.y;
@@ -1058,6 +1075,27 @@ void AmsMapingPopup::set_reset_callback(ResetCallback callback) {
      m_reset_callback = callback;
 }
 
+AmsMapingPopup::~AmsMapingPopup()
+{
+    clear_parent_item_selection();
+#ifdef __APPLE__
+    destroy_tip_popup();
+#endif
+}
+
+void AmsMapingPopup::set_parent_item(MaterialItem *item)
+{
+    if (m_parent_item.get() == item)
+        return;
+    clear_parent_item_selection();
+    m_parent_item = item;
+}
+
+void AmsMapingPopup::clear_parent_item_selection()
+{
+    clear_transient_selection(m_parent_item, [](MaterialItem &item) { item.on_normal(); });
+}
+
 void AmsMapingPopup::show_reset_button() {
     m_reset_btn->Show();
 }
@@ -1114,19 +1152,44 @@ void AmsMapingPopup::update_materials_list(std::vector<std::string> list)
 void AmsMapingPopup::set_tag_texture(std::string texture)
 {
     m_tag_material = texture;
+    m_tag_filament_id.clear();
 }
 
 
 bool AmsMapingPopup::is_match_material(std::string material) const
 {
-    //y75
-    auto toLower = [](std::string s) -> std::string{
-        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
-        return s;
+    return QDSBoxSync::filament_selection_compatible(m_tag_material, {}, material, {}, true);
+}
+
+bool AmsMapingPopup::is_match_filament(const TrayData &tray_data, bool enforce_material) const
+{
+    return QDSBoxSync::filament_selection_compatible(m_tag_material,
+                                                     m_tag_filament_id,
+                                                     tray_data.filament_type,
+                                                     tray_data.filament_preset_id,
+                                                     enforce_material);
+}
+
+MappingItem* AmsMapingPopup::find_mapping_item(int tray_id, int ams_id, int slot_id) const
+{
+    const auto matches = [tray_id, ams_id, slot_id](const MappingItem *item) {
+        return item && item->m_tray_data.id == tray_id &&
+               item->m_tray_data.ams_id == ams_id &&
+               item->m_tray_data.slot_id == slot_id;
     };
-    std::string m_tag_material_to_lowser = toLower(m_tag_material);
-    std::string material_to_lower = toLower(material);
-    return m_tag_material_to_lowser == material_to_lower ? true : false;
+
+    for (MappingItem *item : m_mapping_item_list) {
+        if (matches(item))
+            return item;
+    }
+
+    // External-spool items have dedicated event bindings and are intentionally
+    // absent from m_mapping_item_list on non-Apple platforms.
+    if (matches(m_left_extra_slot))
+        return m_left_extra_slot;
+    if (matches(m_right_extra_slot))
+        return m_right_extra_slot;
+    return nullptr;
 }
 
 
@@ -1149,11 +1212,10 @@ void AmsMapingPopup::on_left_down(wxMouseEvent &evt)
 
         if (pos.x > p_rect.x && pos.y > p_rect.y && pos.x < (p_rect.x + item->GetSize().x) && pos.y < (p_rect.y + item->GetSize().y)) {
             if (item->m_tray_data.type == TrayType::NORMAL) {
-                if (!m_ext_mapping_filatype_check && (item->m_ams_id == VIRTUAL_TRAY_MAIN_ID || item->m_ams_id == VIRTUAL_TRAY_DEPUTY_ID)) {
-                    // Do nothing
-                } else {
-                    if(!is_match_material(item->m_tray_data.filament_type)) { return; }
-                }
+                const bool is_external = item->m_ams_id == VIRTUAL_TRAY_MAIN_ID ||
+                                         item->m_ams_id == VIRTUAL_TRAY_DEPUTY_ID;
+                if (!is_match_filament(item->m_tray_data, !is_external || m_ext_mapping_filatype_check))
+                    return;
             }
 
             if (item->m_tray_data.type == TrayType::EMPTY) return;
@@ -1163,9 +1225,9 @@ void AmsMapingPopup::on_left_down(wxMouseEvent &evt)
                 (m_show_type == ShowType::RIGHT && item->GetParent()->GetName() == "right") ||
                 m_show_type == ShowType::LEFT_AND_RIGHT ||
                 m_show_type == ShowType::LEFT_AND_RIGHT_DYNAMIC) {
-                item->send_event(m_current_filament_id);
-                Dismiss();
-                break;
+                dismiss_transient_after_selection(this, item->send_event(m_current_filament_id));
+                evt.StopPropagation();
+                return;
             }
         }
     }
@@ -1175,6 +1237,11 @@ void AmsMapingPopup::on_left_down(wxMouseEvent &evt)
 #ifdef  __APPLE__
 void AmsMapingPopup::on_mouse_move(wxMouseEvent &evt)
 {
+    if (!can_show_transient_child(this)) {
+        destroy_tip_popup();
+        evt.Skip();
+        return;
+    }
 
     auto pos = ClientToScreen(evt.GetPosition());
     wxString tip_text;
@@ -1204,13 +1271,6 @@ void AmsMapingPopup::on_mouse_move(wxMouseEvent &evt)
             m_tip_label->SetForegroundColour(*wxBLACK);
             sizer->Add(m_tip_label, 0, wxALL, 4);
             m_tip_popup->SetSizer(sizer);
-            m_tip_popup->Bind(wxEVT_IDLE, [this](wxIdleEvent &) {
-                if (!IsShown() && m_tip_popup) {
-                    m_tip_popup->Destroy();
-                    m_tip_popup = nullptr;
-                    m_tip_label = nullptr;
-                    }
-            });
         }
 
 
@@ -1227,14 +1287,51 @@ void AmsMapingPopup::on_mouse_move(wxMouseEvent &evt)
         if (m_tip_popup && m_tip_popup->IsShown()) m_tip_popup->Hide();
     }
 }
+
+void AmsMapingPopup::destroy_tip_popup()
+{
+    m_tip_label = nullptr;
+    destroy_transient_popup(m_tip_popup);
+}
 #endif
+
+void AmsMapingPopup::Dismiss()
+{
+    const bool was_shown = IsShown();
+    wxWeakRef<wxWindow> owner(GetParent());
+#ifdef __APPLE__
+    // Hide the Cocoa popup while wxWidgets still considers it shown. Calling
+    // Dismiss() first changes the wx state before a direct native hide can be
+    // requested, which can leave an empty popup surface composited over the
+    // print dialog. Do this before clearing and repainting the selected item.
+    if (was_shown)
+        ensure_transient_popup_hidden(this);
+#endif
+    clear_parent_item_selection();
+    PopupWindow::Dismiss();
+#ifdef __APPLE__
+    // Keep the post-dismiss check as a defensive fallback for alternate close
+    // paths, including parent-window teardown.
+    ensure_transient_popup_hidden(this);
+    destroy_tip_popup();
+    // Cocoa may leave the native popup border composited after its contents
+    // disappear. Repaint the owning dialog on the next event-loop turn, after
+    // wxPopupTransientWindow has completed native dismissal.
+    if (was_shown && wxTheApp) {
+        wxTheApp->CallAfter([owner]() {
+            refresh_transient_owner(owner);
+        });
+    }
+#endif
+}
 
 void AmsMapingPopup::OnDismiss()
 {
+    clear_parent_item_selection();
 #ifdef __APPLE__
-    if (m_tip_popup && m_tip_popup->IsShown ())
-        m_tip_popup->Hide();
+    destroy_tip_popup();
 #endif
+    PopupWindow::OnDismiss();
 }
 
 bool AmsMapingPopup::ProcessLeftDown(wxMouseEvent &event)
@@ -1303,7 +1400,7 @@ void AmsMapingPopup::update_flush_waste(MachineObject* obj)
 }
 
 
-void MappingItem::send_event(int fliament_id)
+bool MappingItem::send_event(int fliament_id)
 {
     wxCommandEvent event(EVT_SET_FINISH_MAPPING);
     event.SetInt(m_tray_data.id);
@@ -1312,10 +1409,12 @@ void MappingItem::send_event(int fliament_id)
        m_tray_data.ams_id, m_tray_data.slot_id);
     event.SetString(param);
 
-    if (send_win) {
+    if (send_win && !send_win->IsBeingDeleted()) {
         event.SetEventObject(send_win);
         wxPostEvent(send_win, event);
+        return true;
     }
+    return false;
 }
 
  void MappingItem::msw_rescale()

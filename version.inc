@@ -11,6 +11,8 @@ if(NOT DEFINED QDT_INTERNAL_TESTING)
 set(QDT_INTERNAL_TESTING "0")
 endif()
 
+set(QDT_LOCAL_BUILD_LABEL "" CACHE STRING "Optional local build label shown on the splash screen")
+
 # The build_version should start from 50 in master branch
 
 set(SLIC3R_VERSION "02.07.02.60")

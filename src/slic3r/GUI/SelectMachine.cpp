@@ -20,6 +20,7 @@
 
 #include "DeviceCore/DevConfig.h"
 #include "DeviceCore/DevPrintOptions.h"
+#include "DeviceCore/QDSPrintOptions.hpp"
 #include "DeviceCore/DevMappingNozzle.h"
 #include "DeviceCore/DevNozzleSystem.h"
 #include "DeviceCore/DevExtensionTool.h"
@@ -36,6 +37,7 @@
 
 #include "DeviceCore/DevManager.h"
 #include "DeviceCore/DevMapping.h"
+#include "Widgets/TransientWindowCleanup.hpp"
 
 #include "DeviceCore/DevUtilBackend.h"
 
@@ -44,6 +46,7 @@
 #include <wx/display.h>
 #include <wx/progdlg.h>
 #include <wx/clipbrd.h>
+#include <wx/weakref.h>
 #include <wx/dcgraph.h>
 #include <wx/mstream.h>
 #include <miniz.h>
@@ -84,6 +87,11 @@ wxDEFINE_EVENT(EVT_UPDATE_USER_MACHINE_LIST, wxCommandEvent);
 wxDEFINE_EVENT(EVT_PRINT_JOB_CANCEL, wxCommandEvent);
 wxDEFINE_EVENT(EVT_CLEAR_IPADDRESS, wxCommandEvent);
 
+static QDSPrintOptions::BedLevelingPreparation current_bed_leveling_preparation(PrintOption *option)
+{
+    return QDSPrintOptions::prepare_bed_leveling(option ? option->getValue() : std::string{});
+}
+
 #define INITIAL_NUMBER_OF_MACHINES 0
 
 #define MACHINE_LIST_REFRESH_INTERVAL 2000
@@ -115,6 +123,27 @@ static bool _HasAms(const std::vector<FilamentInfo>& ams_mapping_result) {
     }
 
     return false;
+}
+
+static std::string qds_mapping_persistence_key()
+{
+    auto *plater = wxGetApp().plater();
+    return plater ? plater->box_msg.box_list_preset_name : std::string{};
+}
+
+static QDSBoxSync::MappingPreferences load_qds_mapping_preferences(const std::string &key, const std::string &device_id)
+{
+    if (key.empty() || !wxGetApp().app_config)
+        return {};
+
+    const std::string storage_key = QDSBoxSync::mapping_storage_key(key);
+    const std::string stored_json = wxGetApp().app_config->get("ams_filament_ids", storage_key);
+    std::vector<std::string> diagnostics;
+    auto preferences = QDSBoxSync::deserialize_mapping_preferences(
+        stored_json, QDSBoxSync::MappingContext{key, device_id}, &diagnostics);
+    for (const std::string &diagnostic : diagnostics)
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": " << diagnostic;
+    return preferences;
 }
 
 std::string get_nozzle_volume_type_cloud_string(NozzleVolumeType nozzle_volume_type)
@@ -856,7 +885,12 @@ SelectMachineDialog::SelectMachineDialog(Plater *plater)
     m_checkbox_list["flow_cali"]     = option_flow_dynamics_cali;
     m_checkbox_list["nozzle_offset_cali"] = option_nozzle_offset_cali_cali;
     for (auto print_opt : m_checkbox_list_order) {
-        print_opt->Bind(EVT_SWITCH_PRINT_OPTION, [this](auto& e) { save_option_vals(); e.Skip();});
+        print_opt->Bind(EVT_SWITCH_PRINT_OPTION, [this, option_auto_bed_level, print_opt](auto& e) {
+            save_option_vals();
+            if (print_opt == option_auto_bed_level)
+                refresh_save_time(get_current_machine());
+            e.Skip();
+        });
     }
 
     option_auto_bed_level->Hide();
@@ -1274,6 +1308,7 @@ void SelectMachineDialog::sync_ams_mapping_result(const std::vector<FilamentInfo
             wxString ams_id = "Ext";//
             wxColour ams_col = wxColour(0xCE, 0xCE, 0xCE);
             it->second->item->set_ams_info(ams_col, ams_id);
+            it->second->item->restore_material_display();
             it->second->item->set_nozzle_info(get_mapped_nozzle_str(it->first));
         }
         return;
@@ -1317,6 +1352,12 @@ void SelectMachineDialog::sync_ams_mapping_result(const std::vector<FilamentInfo
                     cols.push_back(DevAmsTray::decode_color(col));
                 }
                 m->set_ams_info(ams_col, ams_id,f->ctype, cols);
+                if (get_current_qds_device()) {
+                    if (f->tray_id >= 0)
+                        m->set_material_display(ams_col, f->ctype, cols);
+                    else
+                        m->restore_material_display();
+                }
                 m->set_nozzle_info(get_mapped_nozzle_str(id));
                 break;
             }
@@ -1347,6 +1388,7 @@ bool SelectMachineDialog::do_ams_mapping(MachineObject *obj_,bool use_ams, bool 
 {
     //y59
     std::vector<std::string> box_colors = m_plater->box_msg.filament_colors;
+    m_cur_colors_in_thumbnail.clear();
     for (std::string color : box_colors) {
         if (!color.empty()) {
             color.erase(0, 1);
@@ -1454,6 +1496,8 @@ bool SelectMachineDialog::do_ams_mapping(MachineObject *obj_,bool use_ams, bool 
         filament_result = DevMappingUtil::ams_filament_mapping(obj_, m_filaments, m_ams_mapping_result, map_opt, {}, false, from_sdcard_view, m_printer_last_select);
         // auto_supply_with_ext(obj_->vt_slot);
     }
+
+    restore_qds_mapping_preferences();
 
     if (filament_result == 0) {
         print_ams_mapping_result(m_ams_mapping_result);
@@ -1710,6 +1754,7 @@ void SelectMachineDialog::refresh_save_time(MachineObject *obj)
         PartPlate* plate = m_plater->get_partplate_list().get_curr_plate();
         if (plate && plate->get_slice_result()) {
             float base_time = plate->get_slice_result()->print_statistics.modes[0].time;
+            base_time += current_bed_leveling_preparation(m_checkbox_list["bed_leveling"]).estimated_overhead_seconds;
             if (save_time.has_value()) {
                 base_time += save_time.value();
                 if (base_time < 0) base_time = 0;
@@ -2133,8 +2178,7 @@ void SelectMachineDialog::init_timer()
 
 void SelectMachineDialog::on_cancel(wxCloseEvent &event)
 {
-    if (m_mapping_popup.IsShown())
-        m_mapping_popup.Dismiss();
+    dismiss_transient_popups();
 
     if (m_print_job) {
         if (m_print_job->is_running()) {
@@ -2370,6 +2414,9 @@ void SelectMachineDialog::on_ok_btn(wxCommandEvent &event)
         upload_file_name += ".gcode.3mf";
         //cj_5
         // Reuse Plater packaging so imported gcode 3mf files keep their original slice info.
+        const auto bed_leveling = current_bed_leveling_preparation(m_checkbox_list["bed_leveling"]);
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": packaging bed-leveling choice in print job; overhead_seconds="
+                                << bed_leveling.estimated_overhead_seconds;
         int result = m_plater->send_gcode(m_print_plate_idx, [this](int export_stage, int current, int total, bool& cancel) {
             if (this->m_is_canceled)
                 return;
@@ -2378,7 +2425,7 @@ void SelectMachineDialog::on_ok_btn(wxCommandEvent &event)
             wxString msg = _L("Preparing print job");
             m_status_bar->update_status(msg, cancelled, 10, true);
             m_export_3mf_cancel = cancel = cancelled;
-        });
+        }, bed_leveling.gcode_preamble, bed_leveling.estimated_overhead_seconds);
 
         //cj_5
         if (m_is_canceled || m_export_3mf_cancel) {
@@ -3581,19 +3628,23 @@ void SelectMachineDialog::update_timelapse_folder_btn_icon()
 void SelectMachineDialog::show_timelapse_folder_popup()
 {
     if (m_timelapse_storage_popup && m_timelapse_storage_popup->IsShown()) {
-        m_timelapse_storage_popup->Dismiss();
+        destroy_timelapse_storage_popup();
+        update_timelapse_folder_btn_icon();
         return;
     }
 
+    destroy_timelapse_storage_popup();
+
     // build popup with rounded corners + light border
-    m_timelapse_storage_popup = new PopupWindow(this, wxBORDER_NONE);
+    PopupWindow *popup = new PopupWindow(this, wxBORDER_NONE);
+    m_timelapse_storage_popup = popup;
     m_timelapse_storage_popup->SetBackgroundColour(wxColour(0xF0, 0xF0, 0xF0));
-    m_timelapse_storage_popup->Bind(wxEVT_PAINT, [this](wxPaintEvent&) {
-        wxPaintDC dc(m_timelapse_storage_popup);
-        auto size = m_timelapse_storage_popup->GetSize();
+    m_timelapse_storage_popup->Bind(wxEVT_PAINT, [popup](wxPaintEvent&) {
+        wxPaintDC dc(popup);
+        auto size = popup->GetSize();
         dc.SetPen(wxPen(wxColour(0xCE, 0xCE, 0xCE)));
         dc.SetBrush(wxBrush(wxColour(0xF0, 0xF0, 0xF0)));
-        dc.DrawRoundedRectangle(0, 0, size.x, size.y, FromDIP(8));
+        dc.DrawRoundedRectangle(0, 0, size.x, size.y, popup->FromDIP(8));
     });
 
     auto* panel = new wxPanel(m_timelapse_storage_popup, wxID_ANY);
@@ -3609,6 +3660,7 @@ void SelectMachineDialog::show_timelapse_folder_popup()
     if (!has_sdcard && m_timelapse_storage == "external")
         m_timelapse_storage = "internal";
 
+    wxWeakRef<SelectMachineDialog> weak_dialog(this);
     auto make_item = [&](const wxString& label, const std::string& val, bool enabled) {
         auto* radio = new wxRadioButton(panel, wxID_ANY, label, wxDefaultPosition, wxDefaultSize,
             val == "internal" ? wxRB_GROUP : 0);
@@ -3619,13 +3671,16 @@ void SelectMachineDialog::show_timelapse_folder_popup()
         sizer->Add(radio, 0, wxALIGN_CENTER_VERTICAL);
 
         if (enabled) {
-            radio->Bind(wxEVT_RADIOBUTTON, [this, val](wxCommandEvent&) {
-                m_timelapse_storage = val;
-                update_timelapse_folder_btn_icon();
-                if (m_timelapse_storage_popup) m_timelapse_storage_popup->Dismiss();
+            radio->Bind(wxEVT_RADIOBUTTON, [weak_dialog, val](wxCommandEvent&) mutable {
+                if (!weak_dialog)
+                    return;
+                weak_dialog->m_timelapse_storage = val;
+                weak_dialog->update_timelapse_folder_btn_icon();
+                weak_dialog->destroy_timelapse_storage_popup();
                 DeviceManager* dev = wxGetApp().getDeviceManager();
                 MachineObject* obj = dev ? dev->get_selected_machine() : nullptr;
-                if (obj) check_timelapse_storage_warning(obj);
+                if (obj)
+                    weak_dialog->check_timelapse_storage_warning(obj);
             });
         }
     };
@@ -3643,11 +3698,8 @@ void SelectMachineDialog::show_timelapse_folder_popup()
     m_timelapse_storage_popup->Fit();
 
     // restore normal icon when popup is dismissed
-    m_timelapse_storage_popup->Bind(wxEVT_SHOW, [this](wxShowEvent& e) {
-        if (!e.IsShown())
-            update_timelapse_folder_btn_icon();
-        e.Skip();
-    });
+    m_timelapse_storage_popup->Bind(wxEVT_SHOW,
+        &SelectMachineDialog::on_timelapse_storage_popup_show, this);
 
     wxPoint pos = m_timelapse_folder_btn->ClientToScreen(wxPoint(0, m_timelapse_folder_btn->GetSize().GetHeight()));
     m_timelapse_storage_popup->Position(pos, wxSize(0, 0));
@@ -4076,8 +4128,7 @@ void SelectMachineDialog::on_send_print()
     m_is_canceled = false;
     Enable_Send_Button(false);
 
-    if (m_mapping_popup.IsShown())
-        m_mapping_popup.Dismiss();
+    dismiss_transient_popups();
 
     if (m_print_type == PrintFromType::FROM_NORMAL && m_is_in_sending_mode){
         return;
@@ -4091,13 +4142,39 @@ void SelectMachineDialog::on_send_print()
     DeviceManager* dev = Slic3r::GUI::wxGetApp().getDeviceManager();
     if (!dev) return;
 
-    MachineObject* obj_ = dev->get_selected_machine();
-    assert(obj_->get_dev_id() == m_printer_last_select);
-    if (obj_ == nullptr) { return; }
-
-    if (!DevMappingUtil::is_valid_mapping_result(obj_, m_ams_mapping_result)) {
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << "print_job: invalid mapping";
+    MachineObject *obj_ = dev->get_my_machine(m_printer_last_select);
+    if (!obj_) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": selected printer disappeared before send";
         return;
+    }
+
+    auto qds_device = get_current_qds_device();
+    QDSBoxSync::MappingValidationResult qds_mapping_validation;
+    std::uint64_t qds_mapping_generation = 0;
+    if (qds_device) {
+        const auto box_state = qds_device->getBoxMappingState();
+        if (!box_state.ready) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+                                     << ": QDS Box snapshot is unavailable at send";
+            Enable_Send_Button(true);
+            show_status(PrintDialogStatus::PrintStatusAmsMappingInvalid);
+            return;
+        }
+        qds_mapping_generation = box_state.generation;
+        qds_mapping_validation = QDSBoxSync::validate_mapping_result(box_state.snapshot,
+                                                                    m_ams_mapping_result);
+        if (!qds_mapping_validation.valid) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": invalid QDS mapping: "
+                                     << qds_mapping_validation.reason;
+            Enable_Send_Button(true);
+            show_status(PrintDialogStatus::PrintStatusAmsMappingInvalid);
+            return;
+        }
+    } else {
+        if (!DevMappingUtil::is_valid_mapping_result(obj_, m_ams_mapping_result)) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << "print_job: invalid mapping";
+            return;
+        }
     }
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", print_job: for send task, current printer id =  " << QDTCrossTalk::Crosstalk_DevId(m_printer_last_select) << std::endl;
@@ -4144,13 +4221,16 @@ void SelectMachineDialog::on_send_print()
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "print_job: get_ams_mapping_result end";
 
     if (m_print_type == PrintFromType::FROM_NORMAL) {
+        const auto bed_leveling = current_bed_leveling_preparation(m_checkbox_list["bed_leveling"]);
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": packaging bed-leveling choice in print job; overhead_seconds="
+                                << bed_leveling.estimated_overhead_seconds;
         result = m_plater->send_gcode(m_print_plate_idx, [this](int export_stage, int current, int total, bool& cancel) {
             if (this->m_is_canceled) return;
             bool     cancelled = false;
             wxString msg = _L("Preparing print job");
             m_status_bar->update_status(msg, cancelled, 10, true);
             m_export_3mf_cancel = cancel = cancelled;
-            });
+            }, bed_leveling.gcode_preamble, bed_leveling.estimated_overhead_seconds);
 
         if (m_is_canceled || m_export_3mf_cancel) {
             BOOST_LOG_TRIVIAL(info) << "print_job: m_export_3mf_cancel or m_is_canceled";
@@ -4264,7 +4344,10 @@ void SelectMachineDialog::on_send_print()
         m_checkbox_list["enable_polar_cooler"]->getValueInt()
     );
 
-    if (obj_->HasAms()) {
+    if (qds_device) {
+        m_print_job->task_use_ams = qds_mapping_validation.uses_box;
+    }
+    else if (obj_->HasAms()) {
         bool has_ext = _HasExt(m_ams_mapping_result);
         bool has_ams = _HasAms(m_ams_mapping_result);
 
@@ -4297,6 +4380,26 @@ void SelectMachineDialog::on_send_print()
     if (agent) {
         std::string dev_ota_str = "dev_ota_ver:" + obj_->get_dev_id();
         agent->track_update_property(dev_ota_str, obj_->get_ota_version());
+    }
+
+    if (qds_device) {
+        const auto latest_box_state = qds_device->getBoxMappingState();
+        const auto latest_validation = latest_box_state.ready
+            ? QDSBoxSync::validate_mapping_result(latest_box_state.snapshot, m_ams_mapping_result)
+            : QDSBoxSync::MappingValidationResult{};
+        const bool snapshot_changed = latest_box_state.ready &&
+                                      latest_box_state.generation != qds_mapping_generation;
+        if (!latest_box_state.ready || snapshot_changed || !latest_validation.valid) {
+            const char *reason = !latest_box_state.ready ? "snapshot unavailable" :
+                                 snapshot_changed ? "snapshot generation changed" :
+                                 latest_validation.reason.c_str();
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": QDS Box mapping changed before send: "
+                                     << reason;
+            Enable_Send_Button(true);
+            show_status(PrintDialogStatus::PrintStatusAmsMappingInvalid);
+            return;
+        }
+        m_print_job->task_use_ams = latest_validation.uses_box;
     }
 
     m_print_job->start();
@@ -4348,62 +4451,157 @@ void SelectMachineDialog::on_refresh(wxCommandEvent &event)
     update_user_printer();
 }
 
+std::shared_ptr<QDSDevice> SelectMachineDialog::get_current_qds_device() const
+{
+    auto qds_manager = wxGetApp().qdsdevmanager;
+    if (!qds_manager)
+        return nullptr;
+
+    return qds_manager->getDevice(m_printer_last_select);
+}
+
+void SelectMachineDialog::restore_qds_mapping_preferences()
+{
+    auto device = get_current_qds_device();
+    if (!device)
+        return;
+    const auto box_state = device->getBoxMappingState();
+    if (!box_state.ready || box_state.snapshot.slots.empty())
+        return;
+
+    const std::string key = qds_mapping_persistence_key();
+    const auto preferences = load_qds_mapping_preferences(
+        key, QDSBoxSync::mapping_device_identity(device->m_ip, device->m_id));
+    for (auto &mapping : m_ams_mapping_result) {
+        const auto preference = preferences.find(mapping.id);
+        if (preference == preferences.end())
+            continue;
+
+        const QDSBoxSync::MappingPreference &saved = preference->second;
+        if (!wxGetApp().preset_bundle || mapping.id < 0 ||
+            static_cast<size_t>(mapping.id) >= wxGetApp().preset_bundle->filament_presets.size()) {
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": ignored mapping for a changed project filament "
+                                    << mapping.id;
+            continue;
+        }
+
+        const std::string &project_preset_name = wxGetApp().preset_bundle->filament_presets[mapping.id];
+        const Preset *project_preset = wxGetApp().preset_bundle->filaments.find_preset(project_preset_name);
+        if (!project_preset ||
+            !QDSBoxSync::apply_mapping_preference(mapping, box_state.snapshot, saved,
+                                                  project_preset_name, project_preset->filament_id)) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": ignored stale QDS mapping for project filament "
+                                       << mapping.id << " slot=" << saved.slot_index;
+            continue;
+        }
+
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": restored QDS mapping for project filament "
+                                << mapping.id << " slot=" << saved.slot_index
+                                << " preset_id=" << saved.slot_preset_id;
+    }
+}
+
 void SelectMachineDialog::on_set_finish_mapping(wxCommandEvent &evt)
 {
+    // QDS slot clicks post this event without dismissing the native popup on
+    // macOS. Close it here, on the next event-loop turn, so every success and
+    // rejection path clears Cocoa's transient surface and invalidates its owner.
+    m_mapping_popup.Dismiss();
+
     auto selection_data = evt.GetString();
     auto selection_data_arr = wxSplit(selection_data.ToStdString(), '|');
+
+    std::optional<QDSBoxSync::BoxSnapshot> qds_snapshot;
+    const auto qds_device = get_current_qds_device();
+    if (qds_device) {
+        const auto box_state = qds_device->getBoxMappingState();
+        if (box_state.ready)
+            qds_snapshot = box_state.snapshot;
+    }
 
     //BOOST_LOG_TRIVIAL(info) << "The box mapping selection result: data is " << selection_data;
 
     if (selection_data_arr.size() == 8) {
-        auto ams_colour      = wxColour(wxAtoi(selection_data_arr[0]), wxAtoi(selection_data_arr[1]), wxAtoi(selection_data_arr[2]), wxAtoi(selection_data_arr[3]));
-        int  old_filament_id = (int) wxAtoi(selection_data_arr[5]);
-        if (m_print_type == PrintFromType::FROM_NORMAL) {//todo:support sd card
-            change_default_normal(old_filament_id, ams_colour);
-            final_deal_edge_pixels_data(m_preview_thumbnail_data);
-            set_default_normal(m_preview_thumbnail_data); // do't reset ams
-        }
-
+        const int project_filament_id = wxAtoi(selection_data_arr[5]);
+        const std::string selected_ams_id = selection_data_arr[6].ToStdString();
+        const std::string selected_slot_id = selection_data_arr[7].ToStdString();
+        MappingItem *selected_item = m_mapping_popup.find_mapping_item(
+            evt.GetInt(), wxAtoi(selection_data_arr[6]), wxAtoi(selection_data_arr[7]));
         int ctype = 0;
         std::vector<wxColour> material_cols;
         std::vector<std::string> tray_cols;
-        for (auto mapping_item : m_mapping_popup.m_mapping_item_list) {
-            if (mapping_item->m_tray_data.id == evt.GetInt()) {
-                ctype = mapping_item->m_tray_data.ctype;
-                material_cols = mapping_item->m_tray_data.material_cols;
-                for (auto col : mapping_item->m_tray_data.material_cols) {
-                    wxString color = wxString::Format("#%02X%02X%02X%02X", col.Red(), col.Green(), col.Blue(), col.Alpha());
-                    tray_cols.push_back(color.ToStdString());
-                }
-                break;
+        if (selected_item) {
+            ctype = selected_item->m_tray_data.ctype;
+            material_cols = selected_item->m_tray_data.material_cols;
+            for (const auto &col : selected_item->m_tray_data.material_cols) {
+                wxString color = wxString::Format("#%02X%02X%02X%02X", col.Red(), col.Green(), col.Blue(), col.Alpha());
+                tray_cols.push_back(color.ToStdString());
             }
         }
 
-        //y69
-        FilamentInfo old_info;
-        FilamentInfo new_info;
-        for (auto i = 0; i < m_ams_mapping_result.size(); i++) {
-            if (m_ams_mapping_result[i].id == wxAtoi(selection_data_arr[5])) {
+        const auto target = std::find_if(m_ams_mapping_result.begin(), m_ams_mapping_result.end(),
+                                         [project_filament_id](const FilamentInfo &mapping) {
+                                             return mapping.id == project_filament_id;
+                                         });
+        if (target == m_ams_mapping_result.end()) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": ignored mapping for a missing project filament";
+            return;
+        }
 
-                old_info = m_ams_mapping_result[i];
+        FilamentInfo old_info = *target;
+        FilamentInfo new_info = old_info;
+        new_info.tray_id = evt.GetInt();
+        const wxColour selected_colour(wxAtoi(selection_data_arr[0]), wxAtoi(selection_data_arr[1]),
+                                       wxAtoi(selection_data_arr[2]), wxAtoi(selection_data_arr[3]));
+        const wxString colour = wxString::Format("#%02X%02X%02X%02X", selected_colour.Red(),
+                                                  selected_colour.Green(), selected_colour.Blue(),
+                                                  selected_colour.Alpha());
+        new_info.color = colour.ToStdString().erase(0, 1);
+        new_info.ctype = ctype;
+        new_info.colors = tray_cols;
+        new_info.ams_id = selected_ams_id;
+        new_info.slot_id = selected_slot_id;
 
-                m_ams_mapping_result[i].tray_id = evt.GetInt();
-                auto ams_colour = wxColour(wxAtoi(selection_data_arr[0]), wxAtoi(selection_data_arr[1]), wxAtoi(selection_data_arr[2]), wxAtoi(selection_data_arr[3]));
-                wxString color = wxString::Format("#%02X%02X%02X%02X", ams_colour.Red(), ams_colour.Green(), ams_colour.Blue(), ams_colour.Alpha());
-                m_ams_mapping_result[i].color = color.ToStdString().erase(0, 1);
-                m_ams_mapping_result[i].ctype = ctype;
-                m_ams_mapping_result[i].colors = tray_cols;
-
-                m_ams_mapping_result[i].ams_id = selection_data_arr[6].ToStdString();
-                m_ams_mapping_result[i].slot_id = selection_data_arr[7].ToStdString();
-
-                if (m_ams_mapping_result[i].ams_id == std::to_string(VIRTUAL_TRAY_MAIN_ID) || m_ams_mapping_result[i].ams_id == std::to_string(VIRTUAL_TRAY_DEPUTY_ID)) {
-                }else if (m_ams_mapping_result[i].ams_id >= std::to_string(0)) {
-                }
-
-                new_info = m_ams_mapping_result[i];
+        if (qds_device) {
+            if (!qds_snapshot || !selected_item || !wxGetApp().preset_bundle || project_filament_id < 0 ||
+                static_cast<size_t>(project_filament_id) >= wxGetApp().preset_bundle->filament_presets.size()) {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": rejected incomplete QDS mapping selection";
+                return;
             }
-            BOOST_LOG_TRIVIAL(info) << "The box mapping result: id is " << m_ams_mapping_result[i].id << "tray_id is " << m_ams_mapping_result[i].tray_id;
+            const std::string &project_preset_name = wxGetApp().preset_bundle->filament_presets[project_filament_id];
+            const Preset *project_preset = wxGetApp().preset_bundle->filaments.find_preset(project_preset_name);
+            if (!project_preset) {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": rejected mapping for an unavailable project preset";
+                return;
+            }
+
+            const TrayData &displayed = selected_item->m_tray_data;
+            QDSBoxSync::MappingSelection selection;
+            selection.tray_id = evt.GetInt();
+            selection.ams_id = selected_ams_id;
+            selection.slot_id = selected_slot_id;
+            selection.displayed_preset_id = displayed.filament_preset_id;
+            selection.displayed_material = displayed.filament_type;
+            selection.displayed_colour = wxString::Format("#%02X%02X%02X", displayed.colour.Red(),
+                                                           displayed.colour.Green(), displayed.colour.Blue()).ToStdString();
+            selection.project_preset_id = project_preset->filament_id;
+            selection.project_material = project_preset->config.opt_string("filament_type", 0u);
+            const std::string main_virtual = std::to_string(VIRTUAL_TRAY_MAIN_ID);
+            const std::string deputy_virtual = std::to_string(VIRTUAL_TRAY_DEPUTY_ID);
+            selection.enforce_material = selected_ams_id != main_virtual &&
+                                         selected_ams_id != deputy_virtual;
+            if (!QDSBoxSync::apply_mapping_selection(new_info, *qds_snapshot, selection)) {
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+                                           << ": rejected stale or incompatible QDS mapping selection";
+                return;
+            }
+        }
+
+        *target = new_info;
+        if (m_print_type == PrintFromType::FROM_NORMAL) {//todo:support sd card
+            change_default_normal(project_filament_id, DevAmsTray::decode_color(new_info.color));
+            final_deal_edge_pixels_data(m_preview_thumbnail_data);
+            set_default_normal(m_preview_thumbnail_data); // do't reset ams
         }
 
         for (auto i = 0; i < m_ams_mapping_result.size(); i++) {
@@ -4444,11 +4642,19 @@ void SelectMachineDialog::on_set_finish_mapping(wxCommandEvent &evt)
                         cols.push_back(DevAmsTray::decode_color(col));
                     }
                     m->set_ams_info(ams_col, ams_id, f->ctype, cols);
+                    if (qds_device)
+                        m->set_material_display(ams_col, f->ctype, cols);
+                    break;
+                } else if (f->id == id && qds_device) {
+                    // Reassigning a slot may unmap another project filament.
+                    // Restore that card's project colour immediately.
+                    m->restore_material_display();
                     break;
                 }
                 iter++;
             }
         }
+
     }
 
     update_filament_change_count();
@@ -4947,13 +5153,14 @@ void SelectMachineDialog::on_selection_changed(wxCommandEvent &event)
             has_box_machine = false;
             return;
         }
+        const auto box_state = qds_device->getBoxSyncState();
         bool is_can_change_color = m_plater->is_can_change_color();
         if (extruders_size > 1 && !is_can_change_color) {
-            if (qds_device->m_box_count == 0) {
+            if (!box_state.ready || box_state.snapshot_input.box_count == 0) {
                 show_status(PrintDialogStatus::PrinterNotConnectBox);
                 has_box_machine = false;
             }
-            else 
+            else
                 has_box_machine = true;
 
             if (extruders_size > wxGetApp().preset_bundle->filament_ams_list.size()){
@@ -4961,7 +5168,7 @@ void SelectMachineDialog::on_selection_changed(wxCommandEvent &event)
             }
         }
         else {
-            if (qds_device->m_box_count <= 0)
+            if (!box_state.ready || box_state.snapshot_input.box_count <= 0)
                 has_box_machine = false;
             else
                 has_box_machine = true;
@@ -4981,8 +5188,11 @@ void SelectMachineDialog::on_selection_changed(wxCommandEvent &event)
     } else {
         auto qds_dev = GUI::wxGetApp().qdsdevmanager;
         auto qds_obj = qds_dev->getSelectedDevice();
+        if (!qds_obj)
+            return;
         m_printer_last_select = qds_obj->m_id;
-        has_box_machine = qds_obj->m_box_count != 0 ? true : false;
+        const auto box_state = qds_obj->getBoxSyncState();
+        has_box_machine = box_state.ready && box_state.snapshot_input.box_count > 0;
     }
 
     m_is_printer_change = true;
@@ -5122,9 +5332,6 @@ void SelectMachineDialog::update_filament_change_count()
     m_mapping_sugs_sizer->Show(false);
     m_link_edit_nozzle->Show(false);
 
-    //y
-    MachineObject* obj = new MachineObject("temp_device");
-
     //DeviceManager *dev = Slic3r::GUI::wxGetApp().getDeviceManager();
     //if (!dev) return;
     //MachineObject *obj = dev->get_selected_machine();
@@ -5228,8 +5435,6 @@ static wxString _get_ext_loc_str(const std::unordered_set<int>& extruders, int t
 
 void SelectMachineDialog::update_show_status(MachineObject* obj_)
 {
-    obj_ = new MachineObject("machine_name");
-
     PartPlate* plate = m_plater->get_partplate_list().get_curr_plate();
 
     if (m_print_type == PrintFromType::FROM_NORMAL) {
@@ -5280,7 +5485,8 @@ void SelectMachineDialog::update_show_status(MachineObject* obj_)
     }
 
     /* multi color external change assist*/
-    bool is_support_mutile_color = obj_->is_support_ext_change_assist_old || obj_->is_support_ext_change_assist;
+    const bool is_support_mutile_color = obj_ &&
+        (obj_->is_support_ext_change_assist_old || obj_->is_support_ext_change_assist);
     if (is_support_mutile_color && !m_check_ext_change_assist->IsShown()) {
         m_check_ext_change_assist->Show(true);
         m_label_ext_change_assist->Show(true);
@@ -5961,41 +6167,52 @@ void SelectMachineDialog::on_material_item_clicked(MaterialItem* item,
     if (!has_box_machine)
         return;
 
-    MaterialHash::iterator iter = m_materialList.begin();
-    while (iter != m_materialList.end()) {
-        int           id = iter->first;
-        Material* item = iter->second;
-        MaterialItem* m = item->item;
-        m->on_normal();
-        iter++;
+    (void) e;
+    if (m_mapping_popup.IsShown())
+        m_mapping_popup.Dismiss();
+    if (used_filament_idx < 0 || static_cast<size_t>(used_filament_idx) >= preset_fila_infos.size()) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": slicing filament index is out of range";
+        return;
     }
+
+    auto qds_device = get_current_qds_device();
+    MachineObject *machine = nullptr;
+    if (qds_device) {
+        auto qds_manager = wxGetApp().qdsdevmanager;
+        if (!qds_manager || !qds_manager->upBoxInfoToBoxMsg(qds_device)) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": selected QDS Box snapshot is incompatible or unavailable";
+            return;
+        }
+        const auto box_state = qds_device->getBoxMappingState();
+        if (!box_state.ready || box_state.snapshot.slots.empty()) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": selected QDS Box has no validated occupied slots";
+            return;
+        }
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": opening QDS mapping popup with "
+                                << box_state.snapshot.slots.size() << " occupied slots";
+    } else {
+        machine = get_current_machine();
+        if (!machine) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": no connected QDS device or generic machine is available";
+            return;
+        }
+    }
+
+    for (auto &entry : m_materialList)
+        entry.second->item->on_normal();
 
     m_current_filament_id = used_filament_idx;
     item->on_selected();
-
-    auto    mouse_pos = ClientToScreen(e.GetPosition());
-    wxPoint rect = item->ClientToScreen(wxPoint(0, 0));
-
-    // update ams data
-//y80
-    // DeviceManager* dev_manager = Slic3r::GUI::wxGetApp().getDeviceManager();
-    // if (!dev_manager) return;
-    // MachineObject* obj_ = dev_manager->get_selected_machine();
-    MachineObject* obj_ = new MachineObject("temp_obj");
-    if (obj_) {
-        if (m_mapping_popup.IsShown()) return;
-        if (preset_fila_infos.size() <= used_filament_idx) return;
-        //if (obj_ && obj_->get_dev_id() == m_printer_last_select) {
-        m_mapping_popup.set_parent_item(item);
-        m_mapping_popup.set_current_filament_id(used_filament_idx);
-        m_mapping_popup.set_tag_texture(preset_fila_infos[used_filament_idx].filament_type);
-        m_mapping_popup.set_send_win(this);//fix bug:fisrt click is not valid
-        m_mapping_popup.set_show_type(get_filament_mapping_show_type(obj_, used_filament_idx));
-        m_mapping_popup.update(obj_, m_ams_mapping_result, nullptr, use_dynamic_nozzle_map(), m_print_type, m_printer_last_select);
-        m_mapping_popup.Popup();
-        //}
-    }
-//y80
+    m_mapping_popup.set_parent_item(item);
+    m_mapping_popup.set_current_filament_id(used_filament_idx);
+    m_mapping_popup.set_tag_texture(preset_fila_infos[used_filament_idx].filament_type);
+    if (qds_device)
+        m_mapping_popup.set_tag_filament_id(preset_fila_infos[used_filament_idx].filament_id);
+    m_mapping_popup.set_send_win(this);
+    m_mapping_popup.set_show_type(get_filament_mapping_show_type(machine, used_filament_idx));
+    m_mapping_popup.update(machine, m_ams_mapping_result, qds_device, use_dynamic_nozzle_map(), m_print_type,
+                           std::string{});
+    m_mapping_popup.Popup();
 }
 
 void SelectMachineDialog::reset_and_sync_ams_list()
@@ -6420,12 +6637,7 @@ void SelectMachineDialog::set_default_normal(const ThumbnailData &data)
 
 #endif // __WXOSX_MAC__
     // basic info
-    auto       aprint_stats = m_plater->get_partplate_list().get_current_fff_print().print_statistics();
-    wxString   time;
-    PartPlate *plate = m_plater->get_partplate_list().get_curr_plate();
-    if (plate) {
-        if (plate->get_slice_result()) { time = wxString::Format("%s", short_time(get_time_dhms(plate->get_slice_result()->print_statistics.modes[0].time + 600.0f))); }    //y68
-    }
+    auto aprint_stats = m_plater->get_partplate_list().get_current_fff_print().print_statistics();
 
     char weight[64];
     if (wxGetApp().app_config->get("use_inches") == "1") {
@@ -6434,7 +6646,6 @@ void SelectMachineDialog::set_default_normal(const ThumbnailData &data)
         ::sprintf(weight, "%.2f g", aprint_stats.total_weight);
     }
 
-    m_stext_time->SetLabel(time);
     m_stext_weight->SetLabel(weight);
     refresh_save_time(obj_);
 }
@@ -6858,6 +7069,7 @@ void SelectMachineDialog::set_default_from_sdcard()
                     m_mapping_popup.set_parent_item(item);
                     m_mapping_popup.set_current_filament_id(fo.id);
                     m_mapping_popup.set_tag_texture(fo.type);
+                    m_mapping_popup.set_tag_filament_id(fo.filament_id);
                     m_mapping_popup.set_send_win(this);
                     m_mapping_popup.update(nullptr, m_ams_mapping_result, obj, false, std::nullopt, "");
                     m_mapping_popup.Popup();
@@ -6948,7 +7160,9 @@ bool SelectMachineDialog::Show(bool show)
             }
         };
     } else {
-        m_refresh_timer->Stop();
+        if (m_refresh_timer)
+            m_refresh_timer->Stop();
+        dismiss_transient_popups();
         return DPIDialog::Show(false);
     }
 
@@ -6981,7 +7195,39 @@ bool SelectMachineDialog::Show(bool show)
 
 SelectMachineDialog::~SelectMachineDialog()
 {
-    delete m_refresh_timer;
+    dismiss_transient_popups();
+    if (m_refresh_timer) {
+        m_refresh_timer->Stop();
+        delete m_refresh_timer;
+        m_refresh_timer = nullptr;
+    }
+}
+
+void SelectMachineDialog::dismiss_transient_popups()
+{
+    dismiss_transient_popup(&m_mapping_popup);
+    dismiss_transient_popup(&m_mapping_tip_popup);
+    dismiss_transient_popup(&m_mapping_tutorial_popup);
+    destroy_timelapse_storage_popup();
+}
+
+void SelectMachineDialog::destroy_timelapse_storage_popup()
+{
+    PopupWindow *popup = m_timelapse_storage_popup;
+    if (!popup)
+        return;
+
+    popup->Unbind(wxEVT_SHOW, &SelectMachineDialog::on_timelapse_storage_popup_show, this);
+    destroy_transient_popup(m_timelapse_storage_popup);
+}
+
+void SelectMachineDialog::on_timelapse_storage_popup_show(wxShowEvent &event)
+{
+    if (!event.IsShown()) {
+        update_timelapse_folder_btn_icon();
+        destroy_timelapse_storage_popup();
+    }
+    event.Skip();
 }
 
 void SelectMachineDialog::UpdateStatusCheckWarning_ExtensionTool(MachineObject* obj_)

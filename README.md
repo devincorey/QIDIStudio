@@ -12,20 +12,20 @@ official product description, documentation, support channels, and upstream
 source, see [QIDI's original README](https://github.com/QIDITECH/QIDIStudio#readme).
 
 [Download the latest GeekCraft macOS build](https://github.com/devincorey/QIDIStudio/releases/latest)
-· [View the current release notes](https://github.com/devincorey/QIDIStudio/releases/tag/geekcraft-v2.07.02.60-gc.8)
-· [Browse the patched source](https://github.com/devincorey/QIDIStudio/tree/geekcraft/02.07.02.60-gc.8)
+· [View the current release notes](https://github.com/devincorey/QIDIStudio/releases/tag/geekcraft-v2.07.02.60-gc.9)
+· [Browse the patched source](https://github.com/devincorey/QIDIStudio/tree/geekcraft/02.07.02.60-gc.9)
 · [Visit the official QIDIStudio repository](https://github.com/QIDITECH/QIDIStudio)
 
 ## Build scope
 
 The downloadable application is a **macOS-only Apple Silicon (`arm64`) build**.
-The current `GeekCraft 02.07.02.60-gc.8` release has the following provenance:
+The current `GeekCraft 02.07.02.60-gc.9` release has the following provenance:
 
 | Item | Value |
 | --- | --- |
 | Upstream release | `QIDIStudio v2.07.02.60` |
 | Upstream commit | `c58fdc56629005395a672cb4e8713018a087df1b` |
-| Patched source commit | `7e93a7339e02e4d33d356ca7dea27e0e800e2c6d` |
+| Patched source commit | `5365f48848c2c251182dd51e2489a6ca30c9d827` |
 | Build system | macOS 27.0 beta (`26A5416b`), macOS SDK 27.0 |
 | Compiler | Apple clang 21.0.0 |
 | Architecture | Apple Silicon (`arm64`) |
@@ -37,11 +37,11 @@ macOS 27 is required to run the application.
 
 The default `main` branch tracks upstream source plus this fork landing page.
 Patched source for a packaged build lives on its matching `geekcraft/*` release
-branch and annotated release tag; use the source link above for `gc.8`.
+branch and annotated release tag; use the source link above for `gc.9`.
 
 ## What this fork fixes
 
-The current build contains 16 reviewable commits grouped into 12 independently
+The current build contains 18 reviewable commits grouped into 14 independently
 managed patch sets. Each patch set can be tested, rebased, or retired separately
 when QIDI fixes the corresponding behavior upstream.
 
@@ -80,7 +80,7 @@ can be distinguished from an official QIDIStudio installation.
 Clears the transient selection state after a Box slot is chosen so the popup's
 white outline does not remain composited over the application.
 
-### 5. Native Box popup dismissal
+### 5. Queued Box popup dismissal
 
 Defers dismissal until the queued macOS slot-selection handler has completed,
 then hides the native popup and repaints its owner. This removes the persistent
@@ -128,6 +128,19 @@ a compatible Generic system preset may be used. Branded QIDI slots still require
 an exact product match, material-family mismatches are rejected, and all slots
 are resolved before any project mapping is changed.
 
+### 13. Process Advanced switch in Develop mode
+
+Shows the Process Advanced switch as On and disabled whenever Develop mode is
+active. Previously the switch could remain visually Off after startup because
+the control was disabled before its value was synchronized.
+
+### 14. Cocoa Box popup pre-hide ordering
+
+Explicitly hides the Box mapping popup while wxWidgets still considers it
+visible, before clearing and repainting its owner. This closes a macOS-specific
+ordering gap that could leave an empty native popup surface composited over the
+print dialog after a Box filament was selected.
+
 ## What this fork does not change
 
 - It does not modify printer firmware, Klipper, Moonraker, or QIDI Box firmware.
@@ -141,21 +154,22 @@ are resolved before any project mapping is changed.
 
 ## Validation
 
-The `gc.8` release passed:
+The `gc.9` release passed:
 
 - 344 assertions across 40 focused QIDI Box synchronization test cases;
 - the Apple dialog lifecycle suite, including repeated popup selection,
-  dismissal, owner repaint, cancel, success, and window-close paths;
+  native pre-hide, dismissal, reopen, owner repaint, cancel, success,
+  window-close, and Develop-as-Advanced state paths;
 - a full macOS Apple Silicon Release build;
 - bundle resource, architecture, dependency, RPATH, and signature checks; and
 - an archive round-trip check matching the executable hash and 4,726 packaged
   resources.
 
-The release archive is ad-hoc signed and is not notarized. Its published SHA-256
-is `50f7595ea65018a125ff941215710aa206012c676f0e835af78e5020bf8e49f8`.
-The Generic-material addition in `gc.8` has automated and build validation but
-still requires final real-printer acceptance; `gc.7` completed live X-Plus 4
-Box synchronization validation.
+The release archive is ad-hoc signed and is not notarized. Its SHA-256 is
+published with the GitHub release. The gc.9 Cocoa pre-hide correction has
+automated lifecycle and build validation but still requires final observation
+on macOS to confirm that the native compositor no longer retains the blank
+surface. Existing QIDI Box synchronization completed live X-Plus 4 validation.
 
 ## Installing the macOS build
 

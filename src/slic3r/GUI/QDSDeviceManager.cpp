@@ -17,6 +17,7 @@
 #include "GUI_Utils.hpp"
 #include "DeviceCore/DevDefs.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -62,6 +63,42 @@ static void apply_gcode_move_speed_percent(QDSDevice& dev, const json& status, b
                 dev.is_update = true;
         }
     } catch (...) {
+    }
+}
+
+std::string endpoint_host(std::string endpoint)
+{
+    const auto first = std::find_if_not(endpoint.begin(), endpoint.end(),
+                                        [](unsigned char ch) { return std::isspace(ch); });
+    const auto last = std::find_if_not(endpoint.rbegin(), endpoint.rend(),
+                                       [](unsigned char ch) { return std::isspace(ch); }).base();
+    endpoint = first < last ? std::string(first, last) : std::string{};
+
+    const size_t scheme = endpoint.find("://");
+    if (scheme != std::string::npos)
+        endpoint.erase(0, scheme + 3);
+    if (const size_t slash = endpoint.find('/'); slash != std::string::npos)
+        endpoint.resize(slash);
+    if (!endpoint.empty() && endpoint.front() == '[') {
+        const size_t closing_bracket = endpoint.find(']');
+        return closing_bracket == std::string::npos ? endpoint : endpoint.substr(1, closing_bracket - 1);
+    }
+    const size_t colon = endpoint.rfind(':');
+    if (colon != std::string::npos && endpoint.find(':') == colon)
+        endpoint.resize(colon);
+    std::transform(endpoint.begin(), endpoint.end(), endpoint.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return endpoint;
+}
+
+void append_reported_models(const LocalDeviceDiscovery::Snapshot &devices,
+                            const std::string &host,
+                            QDSBoxSync::PrinterMetadata &metadata)
+{
+    for (const LocalDiscoveredDevice &candidate : devices) {
+        if (endpoint_host(candidate.ip) == host && !candidate.model.empty() &&
+            std::find(metadata.reported_models.begin(), metadata.reported_models.end(), candidate.model) == metadata.reported_models.end())
+            metadata.reported_models.push_back(candidate.model);
     }
 }
 
@@ -610,6 +647,30 @@ QDSDevice::QDSDevice(const std::string dev_id, const std::string& dev_name, cons
     : m_id(dev_id), m_name(dev_name), m_ip(dev_ip), m_type(dev_type)
     , m_boxData(17), m_boxTemperature(4, 0.0), m_boxHumidity(4, 0)
 {
+    const std::string packaged_catalog_path = Slic3r::resources_dir() + "/profiles/officiall_filas_list.cfg";
+    const auto packaged_catalog = QDSBoxSync::load_packaged_filament_catalog(packaged_catalog_path);
+    for (const std::string &diagnostic : packaged_catalog.diagnostics)
+        BOOST_LOG_TRIVIAL(warning) << "QDS packaged filament catalog: " << diagnostic;
+    if (packaged_catalog.usable) {
+        m_filamentConfig.reserve(packaged_catalog.entries.size());
+        for (const auto &source : packaged_catalog.entries) {
+            Filament target;
+            target.name = source.name;
+            target.type = source.type;
+            target.vendor = source.vendor;
+            target.colorHexCode = source.colour;
+            target.minTemp = source.min_temperature;
+            target.maxTemp = source.max_temperature;
+            target.boxMinTemp = source.box_min_temperature;
+            target.boxMaxTemp = source.box_max_temperature;
+            m_filamentConfig.emplace_back(std::move(target));
+        }
+        BOOST_LOG_TRIVIAL(info) << "QDSDevice: loaded packaged filament catalog fallback with "
+                                << m_filamentConfig.size() << " addressable entries";
+    } else {
+        BOOST_LOG_TRIVIAL(error) << "QDSDevice: packaged filament catalog fallback is unavailable";
+    }
+
     //y79
     m_url = "ws://" + dev_url + ":7125/websocket";
 
@@ -716,7 +777,17 @@ void QDSDevice::updateByJsonData(const json& status)
 				m_print_progress = progress_str;
 			}
 	}
-    if (status.contains("save_variables") && status["save_variables"].is_object()) {
+    const bool has_save_variables = status.contains("save_variables") && status["save_variables"].is_object();
+    bool has_box_stepper = false;
+    if (status.is_object()) {
+        for (auto entry = status.begin(); entry != status.end(); ++entry) {
+            if (entry.key().rfind("box_stepper ", 0) == 0 && entry.value().is_object() && entry.value().contains("runout_button")) {
+                has_box_stepper = true;
+                break;
+            }
+        }
+    }
+    if (has_save_variables || has_box_stepper) {
         updateBoxDataByJson(status);
     }
 
@@ -781,98 +852,214 @@ void QDSDevice::updateByJsonData(const json& status)
 	}
 }
 
-void QDSDevice::updateBoxDataByJson(const json status)
+void QDSDevice::updateBoxDataByJson(const json &status)
 {
-    //y83
-    if (m_filamentConfig.size() == 0) {
-        // Filament config not yet loaded — store the entire status so it can
-        // be re-processed after updateFilamentConfig() completes.
-        std::lock_guard<std::mutex> lock(m_config_mtx);
-        if (m_filamentConfig.size() == 0) {
-            m_pending_save_variables = status;
-            m_has_pending_box_update = true;
-            return;
+	std::lock_guard<std::mutex> config_lock(m_config_mtx);
+	if (m_filamentConfig.empty()) {
+		// Preserve the latest status until the catalog is ready. The catalog
+		// loader drains this payload after releasing m_config_mtx.
+		m_pending_save_variables = status;
+		m_has_pending_box_update = true;
+		return;
+	}
+	const json empty_save_variables = json::object();
+	const json &save_variables = status.contains("save_variables") && status["save_variables"].is_object()
+		? status["save_variables"] : empty_save_variables;
+	if (m_boxData.size() < 17)
+        m_boxData.resize(17);
+
+	QDSBoxSync::BoxSnapshotPatch snapshot_patch;
+    const bool box_count_touched = save_variables.contains("box_count");
+	bool external_touched = false;
+
+    if (box_count_touched) {
+        if (save_variables["box_count"].is_number_integer()) {
+            const int reported_box_count = save_variables["box_count"].get<int>();
+            if (reported_box_count >= 0 && reported_box_count <= QDSBoxSync::max_box_count) {
+                if (!m_box_count_seen || reported_box_count != m_box_snapshot_input.box_count) {
+                    m_box_snapshot_input.slots.clear();
+                    m_box_snapshot_input.external_spool.reset();
+                    m_box_slot_occupancy_seen.fill(false);
+                }
+                m_box_count = reported_box_count;
+                snapshot_patch.box_count = reported_box_count;
+                m_box_count_seen = true;
+            } else {
+                m_box_count_seen = false;
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": rejected out-of-range Box count "
+                                           << reported_box_count;
+            }
+        } else {
+            m_box_count_seen = false;
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": rejected non-integer Box count";
         }
-        // Config became ready while we waited for the lock — fall through.
     }
-	json saveVariables = status["save_variables"];
+
 	for (int i = 0; i < 17; ++i) {
-		std::string serial = "slot" + std::to_string(i);
-		int filamentIndex = getJsonCurStageToInt(saveVariables, "filament_" + serial);
-		if (filamentIndex != -1) {
-            m_boxData[i].filament_idex = filamentIndex;
-			m_boxData[i].name = m_filamentConfig[filamentIndex].name;
-			m_boxData[i].type = m_filamentConfig[filamentIndex].type;
-		}
-		int vendorIndx = getJsonCurStageToInt(saveVariables, "vendor_" + serial);
-		if (vendorIndx != -1) {
-			m_boxData[i].vendor = m_filamentConfig[vendorIndx].vendor;
+		const std::string serial = "slot" + std::to_string(i);
+		QDSBoxSync::RawSlotPatch slot_patch;
+		slot_patch.slot_index = i;
+		bool slot_touched = false;
+		const std::string box_stepper = i < QDSBoxSync::max_box_slots ?
+			"box_stepper " + serial : std::string{};
+		const bool payload_marks_occupied = !box_stepper.empty() && status.contains(box_stepper) &&
+			status[box_stepper].is_object() && status[box_stepper].contains("runout_button") &&
+			status[box_stepper]["runout_button"].is_number_integer() &&
+			status[box_stepper]["runout_button"].get<int>() == 0;
+		const bool identity_update_allowed = i >= QDSBoxSync::max_box_slots ||
+			!m_box_slot_occupancy_seen[i] || m_boxData[i].hasMaterial || payload_marks_occupied;
+		bool ignored_empty_slot_identity = false;
+		auto identity_index = [&](const std::string &key) -> std::optional<int> {
+			if (!save_variables.contains(key) || !save_variables[key].is_number_integer())
+				return std::nullopt;
+			if (!identity_update_allowed) {
+				ignored_empty_slot_identity = true;
+				return std::nullopt;
+			}
+			return save_variables[key].get<int>();
+		};
+
+		const std::string filament_key = "filament_" + serial;
+		if (const auto filament_index = identity_index(filament_key)) {
+			m_boxData[i].filament_idex = -1;
+			m_boxData[i].name.clear();
+			m_boxData[i].type.clear();
+			if (QDSBoxSync::valid_catalog_index(*filament_index, m_filamentConfig.size())) {
+				m_boxData[i].filament_idex = *filament_index;
+				m_boxData[i].name = m_filamentConfig[*filament_index].name;
+				m_boxData[i].type = m_filamentConfig[*filament_index].type;
+			} else {
+				BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": ignored out-of-range filament index for slot " << i;
+			}
+			slot_patch.filament_index = m_boxData[i].filament_idex;
+			slot_patch.material_name = m_boxData[i].name;
+			slot_patch.material_type = m_boxData[i].type;
+			slot_touched = true;
 		}
 
-		int colorIndex = getJsonCurStageToInt(saveVariables, "color_" + serial);
-		if (colorIndex != -1) {
-			m_boxData[i].colorHexCode = m_filamentConfig[colorIndex].colorHexCode;
-
+		const std::string vendor_key = "vendor_" + serial;
+		if (const auto vendor_index = identity_index(vendor_key)) {
+			m_boxData[i].vendor_index = -1;
+			m_boxData[i].vendor.clear();
+			if (QDSBoxSync::valid_catalog_index(*vendor_index, m_filamentConfig.size())) {
+				m_boxData[i].vendor_index = *vendor_index;
+				m_boxData[i].vendor = m_filamentConfig[*vendor_index].vendor;
+			} else {
+				BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": ignored out-of-range vendor index for slot " << i;
+			}
+			slot_patch.vendor_index = m_boxData[i].vendor_index;
+			slot_touched = true;
 		}
-		if (i < 16) {
-            std::string box_stepper = "box_stepper " + serial;
-            if(status.contains(box_stepper)){
-                if(status[box_stepper].contains("runout_button")){
-                    if(!status[box_stepper]["runout_button"].is_null()){
-                        int runout_value = status[box_stepper]["runout_button"].get<int>();
-                        m_boxData[i].hasMaterial = (runout_value == 0) ? 1 : 0;
+
+		const std::string colour_key = "color_" + serial;
+		if (const auto colour_index = identity_index(colour_key)) {
+			m_boxData[i].colour_index = -1;
+			m_boxData[i].colorHexCode.clear();
+			if (QDSBoxSync::valid_catalog_index(*colour_index, m_filamentConfig.size())) {
+				m_boxData[i].colour_index = *colour_index;
+				m_boxData[i].colorHexCode = m_filamentConfig[*colour_index].colorHexCode;
+			} else {
+				BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": ignored out-of-range colour index for slot " << i;
+			}
+			slot_patch.colour_present = true;
+			if (!m_boxData[i].colorHexCode.empty())
+				slot_patch.colour = m_boxData[i].colorHexCode;
+			slot_touched = true;
+		}
+
+		if (ignored_empty_slot_identity)
+			BOOST_LOG_TRIVIAL(debug) << __FUNCTION__
+			                        << ": ignored identity metadata for empty slot " << i;
+
+		if (i < QDSBoxSync::max_box_slots) {
+            if (status.contains(box_stepper) && status[box_stepper].is_object() &&
+                status[box_stepper].contains("runout_button")) {
+                slot_touched = true;
+                if (status[box_stepper]["runout_button"].is_number_integer()) {
+                    m_boxData[i].hasMaterial = status[box_stepper]["runout_button"].get<int>() == 0;
+                    slot_patch.occupied = m_boxData[i].hasMaterial;
+                    m_box_slot_occupancy_seen[i] = true;
+                    if (!m_boxData[i].hasMaterial) {
+                        m_boxData[i].filament_idex = -1;
+                        m_boxData[i].vendor_index = -1;
+                        m_boxData[i].colour_index = -1;
+                        m_boxData[i].name.clear();
+                        m_boxData[i].type.clear();
+                        m_boxData[i].vendor.clear();
+                        m_boxData[i].colorHexCode.clear();
+                        slot_patch.filament_index = -1;
+                        slot_patch.vendor_index = -1;
+                        slot_patch.material_name = std::string{};
+                        slot_patch.material_type = std::string{};
+                        slot_patch.colour_present = true;
+                        slot_patch.colour.reset();
                     }
-                    else {
-                        //m_boxData[i].hasMaterial = false;
-                    }
+                } else {
+                    m_box_slot_occupancy_seen[i] = false;
+                    BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+                                               << ": rejected non-integer occupancy for slot " << i;
                 }
-                else {
-                    //m_boxData[i].hasMaterial = false;
-                }
-            }
-            else {
-                //m_boxData[i].hasMaterial = false;
-            }
+			}
+		}
+
+		if (i < QDSBoxSync::max_box_slots && slot_touched)
+			snapshot_patch.slots.emplace_back(std::move(slot_patch));
+		if (i == 16 && slot_touched)
+			external_touched = true;
+	}
+
+	// Slot 16 is the external spool. Firmware commonly sends an empty record;
+	// only expose it when an update carries an actual filament identity.
+	if (external_touched) {
+		m_boxData[16].hasMaterial = m_boxData[16].filament_idex > 0 &&
+		                            (!m_boxData[16].type.empty() || !m_boxData[16].name.empty());
+	}
+
+	if (save_variables.contains("last_load_slot") && save_variables["last_load_slot"].is_string()) {
+        m_cur_slot = save_variables["last_load_slot"].get<std::string>();
+		snapshot_patch.loaded_slot_present = true;
+		snapshot_patch.loaded_slot.reset();
+		if (m_cur_slot.rfind("slot", 0) == 0) {
+			try {
+				const std::string slot_suffix = m_cur_slot.substr(4);
+				size_t parsed = 0;
+				const int loaded_slot = std::stoi(slot_suffix, &parsed);
+				if (parsed != slot_suffix.size())
+					throw std::invalid_argument("loaded slot contains trailing characters");
+				snapshot_patch.loaded_slot = loaded_slot;
+			} catch (const std::exception &) {
+				BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": invalid loaded-slot value";
+			}
 		}
 	}
 
+    const int auto_read = getJsonCurStageToInt(save_variables, "auto_read_rfid");
+    if (auto_read != -1)
+        m_auto_read_rfid = bool(auto_read);
 
+    const int init_detect = getJsonCurStageToInt(save_variables, "auto_init_detect");
+    if (init_detect != -1)
+        m_init_detect = bool(init_detect);
 
-    //int isExit = getJsonCurStageToInt(saveVariables, "enable_box");
-    //if (isExit != -1) {
-        m_boxData[16].hasMaterial =  true;
-    //}
-	int count = getJsonCurStageToInt(saveVariables, "box_count");
-	if (count != -1) {
-		m_box_count = count;
+    const int auto_reload = getJsonCurStageToInt(save_variables, "auto_reload_detect");
+    if (auto_reload != -1)
+        m_auto_reload_detect = bool(auto_reload);
+
+    m_box_snapshot_input = QDSBoxSync::merge_snapshot_patch(std::move(m_box_snapshot_input), snapshot_patch);
+	if (external_touched && m_boxData[16].hasMaterial) {
+		QDSBoxSync::RawSlot external;
+		external.slot_index     = 16;
+		external.occupied       = true;
+		external.vendor_index   = m_boxData[16].vendor_index;
+		external.filament_index = m_boxData[16].filament_idex;
+		external.material_name  = m_boxData[16].name;
+		external.material_type  = m_boxData[16].type;
+		if (!m_boxData[16].colorHexCode.empty())
+			external.colour = m_boxData[16].colorHexCode;
+		m_box_snapshot_input.external_spool = std::move(external);
+	} else if (external_touched) {
+		m_box_snapshot_input.external_spool.reset();
 	}
-    
-	if (saveVariables.contains("last_load_slot") && saveVariables["last_load_slot"].is_string()) {
-        m_cur_slot = saveVariables["last_load_slot"].get<std::string>();
-	}
-	
-    int b_endstop_state = 0;
-    //twoStageParse1(status, target, first, second, temp_is_update);
-    twoStageParse1(status, b_endstop_state, "", "", box_is_update);
-    if (b_endstop_state == 1) {
-        m_cur_slot = "slot16";
-    }
-
-    int autoReadInt = getJsonCurStageToInt(saveVariables, "auto_read_rfid");
-    if (autoReadInt != -1) {
-        m_auto_read_rfid = bool(autoReadInt);
-    }
-
-    int initDetctInt = getJsonCurStageToInt(saveVariables, "auto_init_detect");
-    if (initDetctInt != -1) {
-        m_init_detect = bool(initDetctInt);
-    }
-
-    int autoReloadInt = getJsonCurStageToInt(saveVariables, "auto_reload_detect");
-    if (autoReloadInt != -1) {
-        m_auto_reload_detect = bool(autoReloadInt);
-    }
-
     //y78
     std::vector<int> slot_state(17);
     std::vector<int> slot_id(17);
@@ -924,233 +1111,200 @@ void QDSDevice::updateBoxDataByJson(const json status)
     m_slot_id = slot_id;
     m_slot_state = slot_state;
 
-    //y83
-    std::string sig;
-    sig.reserve(384);
-    for (int i = 0; i < 17; ++i) {
-        const Filament& f = m_boxData[i];
-        sig += (f.hasMaterial ? '1' : '0');
-        sig += ':';
-        sig += std::to_string(f.filament_idex);
-        sig += ':';
-        sig += f.name;
-        sig += ':';
-        sig += f.type;
-        sig += ':';
-        sig += f.vendor;
-        sig += ':';
-        sig += f.colorHexCode;
-        sig += ';';
+	if (snapshot_patch.slots.empty() && !m_box_snapshot_input.slots.empty())
+		BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ": partial save_variables update preserved the prior Box slot snapshot";
+
+    m_box_snapshot_ready = QDSBoxSync::snapshot_ready_for_sync(
+        m_box_snapshot_input, m_box_count_seen, m_box_slot_occupancy_seen);
+    if (box_count_touched || !snapshot_patch.slots.empty() || external_touched) {
+        ++m_box_snapshot_generation;
+        m_box_mapping_ready = false;
     }
-    sig += std::to_string(m_box_count);
-    sig += '|';
-    sig += m_cur_slot;
-    sig += '|';
-    sig += (m_auto_read_rfid ? '1' : '0');
-    sig += (m_init_detect ? '1' : '0');
-    sig += (m_auto_reload_detect ? '1' : '0');
-    if (sig != m_box_signature) {
-        m_box_signature = std::move(sig);
-        box_is_update = true;
-    }
+    box_is_update = true;
 }
 
 void QDSDevice::updateFilamentConfig()
 {
-    // ── Double-checked locking: skip if already initialized ──
-    if (m_is_init_filamentConfig) {
-        return;
-    }
     {
         std::lock_guard<std::mutex> lock(m_config_mtx);
-        if (m_is_init_filamentConfig) {
+        if (m_is_init_filamentConfig)
             return;
-        }
     }
 
-    // ── Helper: process any save_variables that arrived before config ──
-    // Must be called while holding m_config_mtx.
-    auto flushPendingBoxUpdate = [this]() {
-        if (m_has_pending_box_update.exchange(false)) {
-            json pending = std::move(m_pending_save_variables);
-            m_pending_save_variables = json(); // clear
-            updateBoxDataByJson(pending);
+    auto apply_filament_catalog = [this](const json &catalog) -> bool {
+        if (!catalog.is_object()) {
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": filament catalog was not an object";
+            return false;
         }
-    };
 
-    auto future1 = std::async(std::launch::async, [this, flushPendingBoxUpdate]() {
-        std::string resultBody;
-        //y83
-        std::lock_guard<std::mutex> lock(m_config_mtx);
-
-        // ── Shared lambda: parse result JSON body into m_filamentConfig ──
-        auto parseFilamentJson = [this, &flushPendingBoxUpdate](const json &resultJson) -> bool {
-            try {
-                auto parseToString = [&resultJson](const std::string &name, std::vector<std::string> &data) {
-                    if (!resultJson.contains(name) || !resultJson[name].is_object()) return;
-                    data.resize(100);
-                    for (auto &element : resultJson[name].items()) {
-                        int index = std::stoi(element.key());
-                        data[index] = element.value().get<std::string>();
-                    }
-                };
-                auto parseToInt = [&resultJson](const std::string &name, std::vector<int> &data) {
-                    if (!resultJson.contains(name) || !resultJson[name].is_object()) return;
-                    data.resize(100);
-                    for (auto &element : resultJson[name].items()) {
-                        int index = std::stoi(element.key());
-                        data[index] = element.value().get<int>();
-                    }
-                };
-
-                std::vector<std::string> names, types, colorHexCodes, vendors;
-                parseToString("filament", names);
-                parseToString("type", types);
-                parseToString("colordict", colorHexCodes);
-                parseToString("vendor_list", vendors);
-                std::vector<int> minTemps, maxTemps, boxMinTemps, boxMaxTemps;
-                parseToInt("min_temp", minTemps);
-                parseToInt("max_temp", maxTemps);
-                parseToInt("box_min_temp", boxMinTemps);
-                parseToInt("box_max_temp", boxMaxTemps);
-
-                m_filamentConfig.resize(names.size());
-                for (int i = 1; i < (int)m_filamentConfig.size(); ++i) {
-                    m_filamentConfig[i].name        = names[i];
-                    m_filamentConfig[i].type        = types[i];
-                    m_filamentConfig[i].minTemp     = minTemps[i];
-                    m_filamentConfig[i].maxTemp     = maxTemps[i];
-                    m_filamentConfig[i].boxMinTemp  = boxMinTemps[i];
-                    m_filamentConfig[i].boxMaxTemp  = boxMaxTemps[i];
-                    m_filamentConfig[i].vendor      = vendors[i];
-                    m_filamentConfig[i].colorHexCode= colorHexCodes[i];
-                }
-                m_is_init_filamentConfig = true;
-
-                // Flush any save_variables that were queued while config was loading.
-                flushPendingBoxUpdate();
-
-                return true;
-            } catch (...) {
+        constexpr size_t catalog_size = 100;
+        std::vector<Filament> updated_catalog(catalog_size);
+        auto apply_catalog_field = [&catalog, &updated_catalog](const char *name, auto apply_value) {
+            if (!catalog.contains(name) || !catalog[name].is_object()) {
+                BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog omitted field " << name;
                 return false;
             }
+            try {
+                for (const auto &element : catalog[name].items()) {
+                    size_t parsed = 0;
+                    const long index = std::stol(element.key(), &parsed);
+                    if (parsed != element.key().size() || index < 0 ||
+                        static_cast<size_t>(index) >= updated_catalog.size()) {
+                        BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog ignored out-of-range "
+                                                   << name << " index " << element.key();
+                        return false;
+                    }
+                    apply_value(updated_catalog[static_cast<size_t>(index)], element.value());
+                }
+            } catch (const std::exception &e) {
+                BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog rejected field "
+                                           << name << ": " << e.what();
+                return false;
+            }
+            return true;
         };
+
+        bool valid = true;
+        valid &= apply_catalog_field("filament", [](Filament &item, const json &value) { item.name = value.get<std::string>(); });
+        valid &= apply_catalog_field("type", [](Filament &item, const json &value) { item.type = value.get<std::string>(); });
+        valid &= apply_catalog_field("colordict", [](Filament &item, const json &value) { item.colorHexCode = value.get<std::string>(); });
+        valid &= apply_catalog_field("vendor_list", [](Filament &item, const json &value) { item.vendor = value.get<std::string>(); });
+        valid &= apply_catalog_field("min_temp", [](Filament &item, const json &value) { item.minTemp = value.get<int>(); });
+        valid &= apply_catalog_field("max_temp", [](Filament &item, const json &value) { item.maxTemp = value.get<int>(); });
+        valid &= apply_catalog_field("box_min_temp", [](Filament &item, const json &value) { item.boxMinTemp = value.get<int>(); });
+        valid &= apply_catalog_field("box_max_temp", [](Filament &item, const json &value) { item.boxMaxTemp = value.get<int>(); });
+        if (!valid)
+            return false;
+
+        json pending_status;
+        bool has_pending_status = false;
+        {
+            std::lock_guard<std::mutex> lock(m_config_mtx);
+            if (m_is_init_filamentConfig)
+                return true;
+
+            m_filamentConfig = std::move(updated_catalog);
+            m_is_init_filamentConfig = true;
+            if (m_has_pending_box_update.exchange(false)) {
+                pending_status = std::move(m_pending_save_variables);
+                m_pending_save_variables = json();
+                has_pending_status = true;
+            }
+        }
+
+        // updateBoxDataByJson takes m_config_mtx, so drain the deferred payload
+        // only after the catalog commit lock has been released.
+        if (has_pending_status)
+            updateBoxDataByJson(pending_status);
+        return true;
+    };
+
+    auto future1 = std::async(std::launch::async, [this, apply_filament_catalog]() {
+        std::string result_body;
 
         if (active_p2p) {
 #if QDT_RELEASE_TO_PUBLIC
-            auto& qds_p2p = P2PManager::instance();
+            auto &qds_p2p = P2PManager::instance();
             if (!qds_p2p.isConnected())
                 return;
 
-            std::mutex              syncMutex;
-            std::condition_variable syncCV;
-            bool                    received = false;
+            std::mutex sync_mutex;
+            std::condition_variable sync_cv;
+            bool received = false;
+            const int text_token = qds_p2p.onText(
+                [&](uint8_t, int64_t, int32_t, const uint8_t *data, size_t len) {
+                    {
+                        std::lock_guard<std::mutex> lock(sync_mutex);
+                        result_body.assign(reinterpret_cast<const char *>(data), len);
+                        received = true;
+                    }
+                    sync_cv.notify_one();
+                });
 
-            int textToken = qds_p2p.onText([&](uint8_t type, int64_t reqId, int32_t,
-                                                const uint8_t *data, size_t len) {
-                std::string text((const char *)data, len);
-                {
-                    std::lock_guard<std::mutex> lock(syncMutex);
-                    resultBody = std::move(text);
-                    received = true;
-                }
-                syncCV.notify_one();
-            });
-
-            int64_t reqId = (int64_t)(std::chrono::system_clock::now().time_since_epoch().count());
+            const int64_t request_id =
+                static_cast<int64_t>(std::chrono::system_clock::now().time_since_epoch().count());
             bool sent = false;
-            for (int retry = 0; retry < 5; retry++) {
-                if (qds_p2p.sendTextCommand(R"({"method":"fetch_offical_filament_list"})", reqId) >= 0) {
+            for (int retry = 0; retry < 5; ++retry) {
+                if (qds_p2p.sendTextCommand(R"({"method":"fetch_offical_filament_list"})", request_id) >= 0) {
                     sent = true;
                     break;
                 }
                 std::this_thread::sleep_for(500ms);
             }
-
             if (!sent) {
-                BOOST_LOG_TRIVIAL(error) << "QDSDevice: failed to send fetch_filas_cfg";
-                qds_p2p.off(textToken);
+                BOOST_LOG_TRIVIAL(error) << "QDSDevice: failed to request the filament catalog over P2P";
+                qds_p2p.off(text_token);
                 return;
             }
 
             {
-                std::unique_lock<std::mutex> lock(syncMutex);
-                if (!syncCV.wait_for(lock, std::chrono::seconds(30), [&] { return received; })) {
-                    BOOST_LOG_TRIVIAL(error) << "QDSDevice: fetch_filas_cfg timeout";
-                    qds_p2p.off(textToken);
+                std::unique_lock<std::mutex> lock(sync_mutex);
+                if (!sync_cv.wait_for(lock, std::chrono::seconds(30), [&] { return received; })) {
+                    BOOST_LOG_TRIVIAL(error) << "QDSDevice: filament catalog P2P request timed out";
+                    qds_p2p.off(text_token);
                     return;
                 }
             }
+            qds_p2p.off(text_token);
 
-            qds_p2p.off(textToken);
-
-            if (!resultBody.empty()) {
-                json jsonBody_ = json::parse(resultBody);
-                parseFilamentJson(jsonBody_);
+            try {
+                if (!result_body.empty())
+                    apply_filament_catalog(json::parse(result_body));
+            } catch (const std::exception &e) {
+                BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog P2P response was invalid: " << e.what();
             }
 #endif
+            return;
         }
-        else {
-            if(is_net_device){
+
+        if (is_net_device) {
 #if QDT_RELEASE_TO_PUBLIC
-                HttpData httpData;
-                json bodyJson;
-                bodyJson["serialNumber"] = m_id;
-                httpData.body = bodyJson.dump();
-                std::string region = wxGetApp().app_config->get("region");
-                if (region == "China") {
-                    httpData.env = PRODUCTIONENV;
-                }
-                else {
-                    httpData.env = FOREIGNENV;
-                }
-                httpData.target = PRINTERTYPE;
-                httpData.taskPath = "/get/filament/config/all";
-                bool isSucceed = false;
-                std::string resultBody = MakerHttpHandle::getInstance().httpPostTask(httpData, isSucceed);
+            HttpData http_data;
+            json request;
+            request["serialNumber"] = m_id;
+            http_data.body = request.dump();
+            http_data.env = wxGetApp().app_config->get("region") == "China" ? PRODUCTIONENV : FOREIGNENV;
+            http_data.target = PRINTERTYPE;
+            http_data.taskPath = "/get/filament/config/all";
 
-                if (isSucceed) {
-                    try {
-                        json resultJson = json::parse(resultBody);
-                        json resultJson_ = resultJson["data"];
-                        if (!resultJson_.empty())
-                            parseFilamentJson(resultJson_);
-                    }
-                    catch (...) {
-                    }
-                }
-                else {
-                    BOOST_LOG_TRIVIAL(error) << "http error" << isSucceed << "   " << "httpDatabody:  " <<httpData.body <<  "   " << __FUNCTION__;
-                }
-#endif
-            } else {
-                std::string url = m_frp_url + "/api/qidiclient/config/offical_filament_list";
-                Slic3r::Http httpPost = Slic3r::Http::get(url);
-                httpPost.timeout_max(5)
-                    .header("accept", "application/json")
-                    .header("Content-Type", "application/json")
-                    .on_complete(
-                        [&resultBody](std::string body, unsigned status) {
-                            resultBody = body;
-                        }
-                    )
-                    .on_error(
-                        [this](std::string body, std::string error, unsigned status) {
-
-                        }
-                    ).perform_sync();
-
-                json bodyJson_ = json::parse(resultBody);
-                if (!bodyJson_.contains("result")) return;
-                json resultJson_ = bodyJson_["result"];
-                if (!resultJson_.is_object()) return;
-                if (!resultJson_.empty())
-                    parseFilamentJson(resultJson_);
+            bool succeeded = false;
+            result_body = MakerHttpHandle::getInstance().httpPostTask(http_data, succeeded);
+            if (!succeeded) {
+                BOOST_LOG_TRIVIAL(error) << "QDSDevice: cloud filament catalog request failed";
+                return;
             }
+            try {
+                const json response = json::parse(result_body);
+                if (!response.contains("data") || !apply_filament_catalog(response["data"]))
+                    BOOST_LOG_TRIVIAL(warning) << "QDSDevice: cloud filament catalog response omitted valid data";
+            } catch (const std::exception &e) {
+                BOOST_LOG_TRIVIAL(warning) << "QDS cloud filament catalog response was invalid: " << e.what();
+            }
+#endif
+            return;
         }
-	});
-}
 
+        const std::string catalog_url = m_frp_url + "/api/qidiclient/config/offical_filament_list";
+        Slic3r::Http::get(catalog_url)
+            .timeout_max(5)
+            .header("accept", "application/json")
+            .header("Content-Type", "application/json")
+            .on_complete([&result_body](std::string body, unsigned) { result_body = std::move(body); })
+            .on_error([](std::string, std::string error, unsigned status) {
+                BOOST_LOG_TRIVIAL(warning) << "QDS filament catalog request failed: HTTP "
+                                           << status << ", " << error;
+            })
+            .perform_sync();
+
+        try {
+            const json response = json::parse(result_body);
+            if (!response.contains("result") || !apply_filament_catalog(response["result"]))
+                BOOST_LOG_TRIVIAL(warning) << "QDSDevice: local filament catalog response omitted a valid result";
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(warning) << "QDS local filament catalog response was invalid: " << e.what();
+        }
+    });
+}
 bool QDSDevice::is_online(){
     return m_status!= "offline";
 }
@@ -1231,7 +1385,135 @@ bool extractNumberWithSscanf(const std::string& str, int& result) {
 }
 
 std::vector<float> QDSDevice::getNozzleDiameter(){
+    std::lock_guard<std::mutex> lock(m_config_mtx);
     return m_nozzle_diameter;
+}
+
+bool QDSDevice::setReportedNozzleDiameters(std::vector<float> diameters)
+{
+    const bool has_reported_nozzles = !diameters.empty() &&
+        std::all_of(diameters.begin(), diameters.end(),
+                    [](float diameter) { return std::isfinite(diameter) && diameter > 0.0f; });
+    if (!has_reported_nozzles)
+        diameters.clear();
+    std::lock_guard<std::mutex> lock(m_config_mtx);
+    m_has_reported_nozzle_diameter = true;
+    m_reported_nozzle_metadata_valid = has_reported_nozzles;
+    m_nozzle_diameter = has_reported_nozzles ? std::move(diameters) : std::vector<float>{0.4f};
+    return has_reported_nozzles;
+}
+
+bool QDSDevice::setReportedNozzleDiametersFromJson(const json &value)
+{
+    std::vector<float> diameters;
+    try {
+        const auto append_nozzle = [&diameters](const json &item) {
+            if (item.is_number()) {
+                diameters.push_back(item.get<float>());
+                return;
+            }
+            if (!item.is_string())
+                throw std::invalid_argument("unsupported nozzle diameter value");
+
+            const std::string text = item.get<std::string>();
+            size_t parsed = 0;
+            const float diameter = std::stof(text, &parsed);
+            if (parsed != text.size())
+                throw std::invalid_argument("nozzle diameter contains trailing characters");
+            diameters.push_back(diameter);
+        };
+        if (value.is_array()) {
+            for (const auto &item : value)
+                append_nozzle(item);
+        } else {
+            append_nozzle(value);
+        }
+    } catch (const std::exception &e) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": invalid reported nozzle metadata: " << e.what();
+        diameters.clear();
+    }
+    return setReportedNozzleDiameters(std::move(diameters));
+}
+
+void QDSDevice::resetReportedNozzleMetadata()
+{
+    std::lock_guard<std::mutex> lock(m_config_mtx);
+    m_has_reported_nozzle_diameter = false;
+    m_reported_nozzle_metadata_valid = false;
+    m_nozzle_diameter = {0.4f};
+}
+
+void QDSDevice::resetBoxSyncState()
+{
+    std::lock_guard<std::mutex> lock(m_config_mtx);
+    m_box_snapshot_input = {};
+    m_boxData.assign(17, Filament{});
+    m_box_count = 0;
+    m_cur_slot.clear();
+    m_auto_reload_detect = false;
+    m_box_count_seen = false;
+    m_box_slot_occupancy_seen.fill(false);
+    m_box_snapshot_ready = false;
+    m_box_mapping_ready = false;
+    m_box_snapshot = {};
+    m_filament_colors.clear();
+    m_filament_type.clear();
+    m_filament_id.clear();
+    m_slot_id.clear();
+    m_slot_state.clear();
+    ++m_box_snapshot_generation;
+    box_is_update = true;
+}
+
+QDSBoxSync::PrinterMetadata QDSDevice::getPrinterMetadata()
+{
+    std::lock_guard<std::mutex> lock(m_config_mtx);
+    QDSBoxSync::PrinterMetadata metadata;
+    if (!m_type.empty())
+        metadata.configured_model = m_type;
+    if (m_has_reported_nozzle_diameter) {
+        metadata.reported_nozzles.emplace();
+        if (m_reported_nozzle_metadata_valid)
+            metadata.reported_nozzles->assign(m_nozzle_diameter.begin(), m_nozzle_diameter.end());
+    }
+    return metadata;
+}
+
+QDSDevice::BoxSyncState QDSDevice::getBoxSyncState()
+{
+    std::lock_guard<std::mutex> lock(m_config_mtx);
+    return {m_box_snapshot_input, m_auto_reload_detect, m_box_snapshot_ready,
+            m_box_snapshot_generation};
+}
+
+QDSDevice::BoxMappingState QDSDevice::getBoxMappingState()
+{
+    std::lock_guard<std::mutex> lock(m_config_mtx);
+    return {m_box_mapping_ready, m_box_count, m_box_snapshot, m_filament_colors, m_filament_type,
+            m_filament_id, m_slot_id, m_slot_state, m_box_snapshot_generation};
+}
+
+bool QDSDevice::publishBoxMappingState(const QDSBoxSync::BoxSnapshot &snapshot,
+                                       const std::vector<std::string> &filament_colors,
+                                       const std::vector<std::string> &filament_type,
+                                       const std::vector<std::string> &filament_id,
+                                       const std::vector<int> &slot_id,
+                                       const std::vector<int> &slot_state,
+                                       std::uint64_t expected_generation)
+{
+    std::lock_guard<std::mutex> lock(m_config_mtx);
+    if (!m_box_snapshot_ready || expected_generation != m_box_snapshot_generation)
+        return false;
+
+    m_box_snapshot    = snapshot;
+    m_filament_colors = filament_colors;
+    m_filament_type   = filament_type;
+    m_filament_id     = filament_id;
+    m_slot_id         = slot_id;
+    m_slot_state      = slot_state;
+    m_box_count       = snapshot.box_count;
+    m_box_mapping_ready = true;
+    return true;
 }
 
 //y79
@@ -1520,6 +1802,21 @@ bool QDSDeviceManager::findLocalDeviceBySerial(const std::string& serial, LocalD
     return m_local_discovery.findBySerial(serial, out);
 }
 
+QDSBoxSync::PrinterMetadata QDSDeviceManager::getPrinterMetadataForCompatibility(
+    const std::shared_ptr<QDSDevice>& device) const
+{
+    if (!device)
+        return {};
+
+    QDSBoxSync::PrinterMetadata metadata = device->getPrinterMetadata();
+    const std::string host = endpoint_host(device->m_ip);
+    if (!host.empty()) {
+        append_reported_models(m_local_discovery.snapshot(), host, metadata);
+        append_reported_models(m_ssdp_discovery.snapshot(), host, metadata);
+    }
+    return metadata;
+}
+
 //cj_5
 LocalDeviceDiscovery::Snapshot QDSDeviceManager::snapshotLocalDevices() const
 {
@@ -1763,6 +2060,9 @@ bool QDSDeviceManager::connectDevice(const std::string device_id) {
     }
 
     disconnectDevice(device_id);
+    dev->resetReportedNozzleMetadata();
+    dev->resetBoxSyncState();
+    refreshLocalDevices(false, {});
 
     std::shared_ptr<WebSocketConnect> connection = nullptr;
     {
@@ -2345,14 +2645,8 @@ void QDSDeviceManager::updateDeviceMsg(const std::string& device_id, const json&
                     
                     //y78
                     if(result["config_items"].contains("nozzle.diameter")){
-                        device->m_nozzle_diameter.clear();
-                        if (result["config_items"]["nozzle.diameter"].is_array()) {
-                            for (const auto& item : result["config_items"]["nozzle.diameter"]) {
-                                device->m_nozzle_diameter.push_back(std::stof(item.get<std::string>()));
-                            }
-                        } else {
-                            device->m_nozzle_diameter.push_back(std::stof(result["config_items"]["nozzle.diameter"].get<std::string>()));
-                        }
+                        if (!device->setReportedNozzleDiametersFromJson(result["config_items"]["nozzle.diameter"]))
+                            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": reported nozzle metadata was invalid or empty";
                     }
                 }
 
@@ -2746,81 +3040,104 @@ std::vector<NetDevice> QDSDeviceManager::getNetDevices(){
 }
 #endif
 
-void QDSDeviceManager::upBoxInfoToBoxMsg(std::shared_ptr<QDSDevice>& device){
-    std::vector<int> slot_state(17);
-    std::vector<int> slot_id(17);
+bool QDSDeviceManager::upBoxInfoToBoxMsg(std::shared_ptr<QDSDevice>& device){
+    std::vector<int> slot_state(17, 0);
+    std::vector<int> slot_id(17, -1);
     std::vector<std::string> filament_id(17);
     std::vector<std::string> filament_colors(17);
     std::vector<std::string> filament_type(17);
-    std::string box_list_preset_name;
-    int box_count = 0;
-    int auto_reload_detect = 0;
 
-    if(device == nullptr)
-        return;
-    
-    //y79
-    std::set<std::pair<std::string, std::string>> mapping;
-
-    auto vendor_presets = wxGetApp().preset_bundle->printers.get_presets();
-    for(auto preset : vendor_presets){
-        std::string printer_model = preset.config.opt_string("printer_model");
-        std::string box_id = preset.config.opt_string("box_id");
-
-        if (!printer_model.empty() && !box_id.empty()) {
-            mapping.emplace(printer_model, box_id);
-        }
+    if (device == nullptr || wxGetApp().preset_bundle == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": no selected QDS device or preset bundle";
+        return false;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(manager_mutex_);
-        GUI::wxGetApp().sidebar().update_sync_status(device);
-        for(int i = 0; i < 17; ++i){
-            if(device->m_boxData[i].hasMaterial){
-                slot_state[i] = device->m_boxData[i].hasMaterial;
-                slot_id[i] = i;
-                filament_type[i] = device->m_boxData[i].type;
-                filament_colors[i] = device->m_boxData[i].colorHexCode;
-                
-                std::string slot_vendor = device->m_boxData[i].vendor;
-
-                std::string test_type = "";
-
-                auto it = std::find_if(mapping.begin(), mapping.end(),
-                    [&](const std::pair<std::string, std::string>& pair) {
-                        return pair.first == device->m_type;
-                    });
-
-                if (it != mapping.end()) {
-                    test_type = it->second;
-                }
-
-                std::string test_vendor = slot_vendor == "QIDI" ? "1" : "0";
-                std::string tset_idx = std::to_string(device->m_boxData[i].filament_idex);
-                std::string test_id = "QD_" + test_type + "_" +  test_vendor + "_" + tset_idx;
-                filament_id[i] = test_id;
-            }
-        }
-        box_count = device->m_box_count;
-        auto_reload_detect = device->m_auto_reload_detect;
-        box_list_preset_name = device->m_type;
+    auto &selected_preset = wxGetApp().preset_bundle->printers.get_edited_preset();
+    const std::string selected_model = selected_preset.config.opt_string("printer_model");
+    const std::string box_id = selected_preset.config.opt_string("box_id");
+    const auto *nozzle_opt = selected_preset.config.option<ConfigOptionFloatsNullable>("nozzle_diameter");
+    if (selected_model.empty() || box_id.empty() || nozzle_opt == nullptr || nozzle_opt->values.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": selected printer profile lacks model, Box id, or nozzle metadata";
+        return false;
     }
+
+    QDSBoxSync::PrinterMetadata metadata;
+    const QDSDevice::BoxSyncState box_state = device->getBoxSyncState();
+    if (!box_state.ready) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": Box snapshot is not complete for the current connection";
+        return false;
+    }
+    QDSBoxSync::BoxSnapshotInput snapshot_input = box_state.snapshot_input;
+    metadata = getPrinterMetadataForCompatibility(device);
+
+    const auto compatibility = QDSBoxSync::resolve_compatibility(metadata, selected_model, nozzle_opt->values.front());
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": compatibility=" << compatibility.compatible
+                            << " selected_model=" << selected_model
+                            << " model_fallback=" << compatibility.used_selected_model_fallback
+                            << " nozzle_fallback=" << compatibility.used_selected_nozzle_fallback
+                            << " reported_model_count=" << metadata.reported_models.size()
+                            << " reason=" << compatibility.reason;
+    if (!compatibility.compatible)
+        return false;
+
+    snapshot_input.box_id = box_id;
+    auto snapshot = QDSBoxSync::normalize_snapshot(snapshot_input);
+    for (const auto &diagnostic : snapshot.diagnostics)
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": " << diagnostic;
+
+    for (const auto &slot : snapshot.slots) {
+        const size_t index = static_cast<size_t>(slot.slot_index);
+        if (index >= slot_state.size())
+            continue;
+        slot_state[index]      = 1;
+        slot_id[index]         = slot.slot_index;
+        filament_id[index]     = slot.filament_preset_id.value_or("");
+        filament_colors[index] = slot.colour.value_or("#CECECE");
+        filament_type[index]   = slot.material_type.value_or("");
+        BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ": Box slot=" << slot.slot_index
+                                << " preset_id=" << filament_id[index]
+                                << " material=" << slot.material_name.value_or(filament_type[index])
+                                << " colour=" << filament_colors[index];
+    }
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": Box count=" << snapshot.box_count
+                            << " occupied_slots=" << snapshot.slots.size()
+                            << " external_spool=" << static_cast<bool>(snapshot.external_spool)
+                            << " loaded_slot=" << (snapshot.loaded_slot ? std::to_string(*snapshot.loaded_slot) : "none");
+    if (snapshot.external_spool) {
+        const size_t external_index = static_cast<size_t>(QDSBoxSync::external_spool_slot);
+        slot_state[external_index]      = 1;
+        slot_id[external_index]         = 16;
+        filament_id[external_index]     = snapshot.external_spool->filament_preset_id.value_or("");
+        filament_colors[external_index] = snapshot.external_spool->colour.value_or("#CECECE");
+        filament_type[external_index]   = snapshot.external_spool->material_type.value_or("");
+    }
+
+    if (!device->publishBoxMappingState(snapshot, filament_colors, filament_type,
+                                        filament_id, slot_id, slot_state,
+                                        box_state.generation)) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__
+                                   << ": Box state changed while the mapping snapshot was being prepared";
+        return false;
+    }
+
+    GUI::wxGetApp().sidebar().update_sync_status(device);
 
     wxGetApp().plater()->box_msg.slot_state = slot_state;
     wxGetApp().plater()->box_msg.filament_id = filament_id;
     wxGetApp().plater()->box_msg.filament_colors = filament_colors;
-    wxGetApp().plater()->box_msg.box_count = box_count;
+    wxGetApp().plater()->box_msg.box_count = snapshot.box_count;
     wxGetApp().plater()->box_msg.filament_type = filament_type;
     wxGetApp().plater()->box_msg.slot_id = slot_id;
-    wxGetApp().plater()->box_msg.auto_reload_detect = auto_reload_detect;
-    wxGetApp().plater()->box_msg.box_list_preset_name = box_list_preset_name;
+    wxGetApp().plater()->box_msg.auto_reload_detect = box_state.auto_reload_detect;
+    wxGetApp().plater()->box_msg.box_list_preset_name = selected_preset.name;
     //y78
-    if(box_count > 0)
+    if(snapshot.box_count > 0)
         wxGetApp().plater()->sidebar().box_list_printer_ip = device->m_ip;
     else
         wxGetApp().plater()->sidebar().box_list_printer_ip = "";
 
     GUI::wxGetApp().sidebar().load_box_list();
+    return true;
 }
 
 //y83

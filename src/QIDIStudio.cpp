@@ -62,6 +62,7 @@ using namespace nlohmann;
 #include "libslic3r/Format/OBJ.hpp"
 #include "libslic3r/Format/SL1.hpp"
 #include "libslic3r/Utils.hpp"
+#include "libslic3r/ResultFilePath.hpp"
 #include "libslic3r/Time.hpp"
 #include "libslic3r/Thread.hpp"
 #include "libslic3r/BlacklistedLibraryCheck.hpp"
@@ -463,12 +464,17 @@ void record_exit_reson(std::string outputdir, int code, int plate_id, std::strin
 {
     std::string result_file;
 
-    if (!outputdir.empty())
-        result_file = outputdir + "/result.json";
-    else
-        result_file = "result.json";
-
     try {
+        const boost::filesystem::path current_directory = boost::filesystem::current_path();
+        boost::filesystem::path fallback_directory = data_dir();
+        if (fallback_directory.empty())
+            fallback_directory = boost::filesystem::temp_directory_path() / "QIDIStudio";
+        const boost::filesystem::path result_path = resolve_result_file_path(
+            outputdir, current_directory, resources_dir(), fallback_directory);
+        if (outputdir.empty() && result_path.parent_path() == fallback_directory)
+            boost::filesystem::create_directories(fallback_directory);
+        result_file = result_path.string();
+
         json j;
         //record the headers
         if (sliced_info.downward_machines.size() > 0)

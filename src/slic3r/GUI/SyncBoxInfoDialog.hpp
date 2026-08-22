@@ -10,11 +10,14 @@
 #include "SelectMachine.hpp"
 #include "DeviceManager.hpp"
 #include "BaseTransparentDPIFrame.hpp"
+#include "DeviceCore/QDSBoxSync.hpp"
+#include "DeviceCore/QDSModalClose.hpp"
 class Button;
 class CheckBox;
 class Label;
 namespace Slic3r { namespace GUI {
 class CapsuleButton;
+class QDSDevice;
 class SyncBoxInfoDialog : public DPIDialog
 {
     enum PageType { ptColorMap = 0, ptOverride };
@@ -58,7 +61,10 @@ class SyncBoxInfoDialog : public DPIDialog
 
     std::vector<POItem> ops_auto;
     std::vector<POItem> ops_no_auto;
-    MachineObject* obj_;
+    std::weak_ptr<QDSDevice> m_qds_device;
+    std::uint64_t m_qds_mapping_generation{0};
+    QDSBoxSync::MappingPreferences m_persisted_mappings;
+    QDSModalCloseCoordinator m_modal_close;
 
 protected:
     PrintFromType     m_print_type{FROM_NORMAL};
@@ -237,10 +243,18 @@ public:
         bool direct_sync = true;
         bool is_same_printer = true;
         std::map<int, AMSMapInfo> sync_maps;
+        std::uint64_t qds_snapshot_generation{0};
     };
     SyncBoxInfoDialog(wxWindow *parent, SyncInfo &info);
     ~SyncBoxInfoDialog();
     void set_info(SyncInfo &info);
+    void set_qds_device(const std::shared_ptr<QDSDevice> &device)
+    {
+        m_qds_device = device;
+        m_qds_mapping_generation = 0;
+        m_result.qds_snapshot_generation = 0;
+    }
+    void set_persisted_mappings(const QDSBoxSync::MappingPreferences &mappings) { m_persisted_mappings = mappings; }
     void on_dpi_changed(const wxRect &suggested_rect) override;
     const SyncResult &get_result() { return m_result; }
 
@@ -260,6 +274,9 @@ public:
     void set_check_dirty_fialment(bool flag) { m_check_dirty_fialment = flag; };
 
 private:
+    void        apply_persisted_mappings();
+    bool        validate_qds_mapping_before_sync();
+    void        request_modal_close(int result);
     wxBoxSizer *create_sizer_thumbnail(wxButton *image_button, bool left);
     void        update_when_change_plate(int);
     void        update_when_change_map_mode(int);

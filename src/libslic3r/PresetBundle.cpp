@@ -9,6 +9,7 @@
 #include "Utils.hpp"
 #include "Model.hpp"
 #include "format.hpp"
+#include "QidiBoxFilament.hpp"
 
 #include <algorithm>
 #include <set>
@@ -40,6 +41,67 @@
 //#define SLIC3R_PROFILE_USE_PRESETS_SUBDIR
 
 namespace Slic3r {
+
+namespace {
+
+const Preset *resolve_qidi_box_preset(PresetCollection &filaments,
+                                      const std::vector<std::string> &current_presets,
+                                      std::size_t current_index,
+                                      const std::string &filament_id,
+                                      const std::string &filament_type,
+                                      std::string &reason)
+{
+    using QidiBoxFilament::IdentityKind;
+    const auto identity = QidiBoxFilament::classify(filament_id);
+    if (identity.kind == IdentityKind::NotBox) {
+        reason = "not a QIDI Box identifier";
+        return nullptr;
+    }
+    if (identity.kind == IdentityKind::Malformed) {
+        reason = "malformed QIDI Box filament identifier";
+        return nullptr;
+    }
+
+    std::vector<QidiBoxFilament::PresetCandidate> candidates;
+    std::vector<const Preset *> presets;
+    for (const Preset &preset : filaments) {
+        candidates.push_back({
+            preset.name,
+            preset.filament_id,
+            preset.config.opt_string("filament_type", 0u),
+            preset.is_compatible,
+            preset.is_system,
+            filaments.get_preset_base(preset) == &preset
+        });
+        presets.push_back(&preset);
+    }
+
+    std::optional<std::size_t> current_candidate;
+    if (current_index < current_presets.size()) {
+        const auto current = std::find_if(
+            candidates.begin(), candidates.end(),
+            [&current_presets, current_index](const QidiBoxFilament::PresetCandidate &candidate) {
+                return candidate.name == current_presets[current_index];
+            });
+        if (current != candidates.end())
+            current_candidate = static_cast<std::size_t>(current - candidates.begin());
+    }
+
+    const QidiBoxFilament::Resolution resolution = QidiBoxFilament::resolve_preset(
+        {filament_id, filament_type, current_candidate}, candidates);
+    if (!resolution) {
+        if (identity.kind == IdentityKind::Branded)
+            reason = "exact branded QIDI filament preset is unavailable or incompatible";
+        else if (filament_type.empty())
+            reason = "Generic Box material omitted its material family";
+        else
+            reason = "no compatible current or Generic system preset matches the Box material family";
+        return nullptr;
+    }
+    return presets[resolution.candidate_index];
+}
+
+} // namespace
 
 static std::vector<std::string> s_project_options {
     "flush_volumes_vector",
@@ -2531,6 +2593,31 @@ void PresetBundle::get_ams_cobox_infos(AMSComboInfo &combox_info, bool skip_ext)
         if (filament_id.empty()) {
             continue;
         }
+
+        const auto box_identity = QidiBoxFilament::classify(filament_id);
+        if (box_identity.kind != QidiBoxFilament::IdentityKind::NotBox) {
+            std::string reason;
+            const Preset *resolved = resolve_qidi_box_preset(
+                filaments, this->filament_presets,
+                combox_info.ams_filament_presets.size(), filament_id,
+                ams.opt_string("filament_type", 0u), reason);
+            if (!resolved) {
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << reason << ": " << filament_id;
+                combox_info.clear();
+                return;
+            }
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": resolved " << filament_id << " to "
+                                    << resolved->name << " ("
+                                    << (box_identity.kind == QidiBoxFilament::IdentityKind::Generic
+                                            ? "Generic material policy" : "exact branded identity")
+                                    << ")";
+            combox_info.ams_filament_presets.push_back(resolved->name);
+            combox_info.ams_filament_colors.push_back(filament_color);
+            combox_info.ams_multi_color_filment.push_back(filament_multi_color);
+            combox_info.ams_names.push_back(ams_name);
+            continue;
+        }
+
         if (!filament_changed && this->filament_presets.size() > combox_info.ams_filament_presets.size()) {
             combox_info.ams_filament_presets.push_back(this->filament_presets[combox_info.ams_filament_presets.size()]);
             combox_info.ams_filament_colors.push_back(filament_color);
@@ -2582,7 +2669,6 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
     std::vector<std::string> ams_filament_colors;
     std::vector<std::string> ams_filament_color_types;
     std::vector<AMSMapInfo>  ams_array_maps;
-    ams_multi_color_filment.clear();
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": filament_ams_list size: %1%") % filament_ams_list.size();
     struct AmsInfo
     {
@@ -2597,6 +2683,79 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
     std::vector<AmsInfo> ams_infos;
     int                  index = 0;
     std::set<std::pair<std::string, std::string>> added_filaments;
+
+    // Resolve every QIDI Box slot before mutating maps, project presets, or
+    // parallel colour arrays. Branded IDs require their exact system preset;
+    // vendor-0 Generic IDs retain a compatible current preset, then fall back
+    // only to a compatible Generic system preset.
+    const auto parse_slot_index = [](const std::string &value) -> std::optional<int> {
+        if (value.empty())
+            return std::nullopt;
+        try {
+            size_t parsed = 0;
+            const int slot_index = std::stoi(value, &parsed);
+            if (parsed != value.size() || slot_index < 0)
+                return std::nullopt;
+            return slot_index;
+        } catch (const std::exception &) {
+            return std::nullopt;
+        }
+    };
+
+    bool invalid_qidi_data = false;
+    std::map<const DynamicPrintConfig *, const Preset *> resolved_box_presets;
+    std::set<std::pair<std::string, std::string>> preflight_added_filaments;
+    std::size_t preset_position = 0;
+    for (auto &entry : filament_ams_list) {
+        auto &ams = entry.second;
+        const std::string tray_name = ams.opt_string("tray_name", 0u);
+        const std::string filament_id = ams.opt_string("filament_id", 0u);
+        if (skip_ext && tray_name == "Ext")
+            continue;
+        if (skip_ext && !preflight_added_filaments.emplace(tray_name, filament_id).second)
+            continue;
+        const std::string slot_id = ams.opt_string("slot_id", 0u);
+        if (!parse_slot_index(slot_id)) {
+            unknowns.emplace_back(&ams, L("The printer returned an invalid Box slot identifier; synchronization was not performed."));
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": invalid Box slot identifier";
+            invalid_qidi_data = true;
+            continue;
+        }
+        if (filament_id.empty()) {
+            if (use_map)
+                ++preset_position;
+            continue;
+        }
+
+        const auto identity = QidiBoxFilament::classify(filament_id);
+        if (identity.kind != QidiBoxFilament::IdentityKind::NotBox) {
+            std::string reason;
+            const Preset *resolved = resolve_qidi_box_preset(
+                filaments, this->filament_presets, preset_position, filament_id,
+                ams.opt_string("filament_type", 0u), reason);
+            if (!resolved) {
+                unknowns.emplace_back(
+                    &ams,
+                    identity.kind == QidiBoxFilament::IdentityKind::Generic
+                        ? L("No compatible Generic filament preset matches the Box material family; synchronization was not performed.")
+                        : L("The exact branded QIDI filament preset is unavailable or incompatible; synchronization was not performed."));
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << reason << ": " << filament_id;
+                invalid_qidi_data = true;
+            } else {
+                resolved_box_presets.emplace(&ams, resolved);
+                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": preflight resolved " << filament_id
+                                        << " to " << resolved->name << " ("
+                                        << (identity.kind == QidiBoxFilament::IdentityKind::Generic
+                                                ? "Generic material policy" : "exact branded identity")
+                                        << ")";
+            }
+        }
+        ++preset_position;
+    }
+    if (invalid_qidi_data)
+        return 0;
+    ams_multi_color_filment.clear();
+
     for (auto &entry : filament_ams_list) {
         auto & ams = entry.second;
         auto filament_id = ams.opt_string("filament_id", 0u);
@@ -2614,19 +2773,29 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
         auto filament_color = ams.opt_string("filament_colour", 0u);
         auto filament_color_type = ams.opt_string("filament_colour_type", 0u);
         auto filament_changed = !ams.has("filament_changed") || ams.opt_bool("filament_changed");
-        auto filament_multi_color = ams.opt<ConfigOptionStrings>("filament_multi_colour")->values;
+        std::vector<std::string> filament_multi_color;
+        if (const auto *multi_colour = ams.opt<ConfigOptionStrings>("filament_multi_colour"))
+            filament_multi_color = multi_colour->values;
         //y59
-        auto ams_id     = std::to_string(std::stoi(ams.opt_string("slot_id", 0u)) / 4 + 1);
-        
-        auto slot_id    = ams.opt_string("slot_id", 0u);
+        const auto slot_id = ams.opt_string("slot_id", 0u);
+        const auto slot_index = parse_slot_index(slot_id);
+        if (!slot_index) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": Box slot identifier became invalid after preflight";
+            return 0;
+        }
+        constexpr const char *qds_external_mapping_id = "255";
+        const bool is_external_spool = tray_name == "Ext";
+        const std::string mapping_slot_id = is_external_spool ? qds_external_mapping_id : slot_id;
+        const std::string ams_id = is_external_spool ? qds_external_mapping_id : std::to_string(*slot_index / 4 + 1);
+
         ams_infos.push_back({filament_id.empty() ? false : true,false, filament_color});
-        AMSMapInfo temp = {ams_id, slot_id};
+        AMSMapInfo temp = {ams_id, mapping_slot_id};
         ams_array_maps.push_back(temp);
         index++;
         if (filament_id.empty()) {
             if (use_map) {
                 for (int j = maps.size() - 1; j >= 0; j--) {
-                    if (maps[j].slot_id == slot_id && maps[j].ams_id == ams_id) {
+                    if (maps[j].slot_id == mapping_slot_id && maps[j].ams_id == ams_id) {
                         maps.erase(j);
                     }
                 }
@@ -2641,6 +2810,30 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
             }
             continue;
         }
+
+        const auto box_identity = QidiBoxFilament::classify(filament_id);
+        if (box_identity.kind != QidiBoxFilament::IdentityKind::NotBox) {
+            const auto resolved = resolved_box_presets.find(&ams);
+            if (resolved == resolved_box_presets.end() || !resolved->second) {
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__
+                    << ": QIDI Box preset resolution changed after successful preflight";
+                return 0;
+            }
+
+            const Preset &preset = *resolved->second;
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": sync " << filament_id
+                                    << " as " << preset.name << " ("
+                                    << (box_identity.kind == QidiBoxFilament::IdentityKind::Generic
+                                            ? "retained/fallback Generic material match"
+                                            : "exact branded identity")
+                                    << "), colour " << filament_color;
+            ams_filament_presets.push_back(preset.name);
+            ams_filament_colors.push_back(filament_color);
+            ams_filament_color_types.push_back(filament_color_type);
+            ams_multi_color_filment.push_back(filament_multi_color);
+            continue;
+        }
+
         if (!filament_changed && this->filament_presets.size() > ams_filament_presets.size()) {
             ams_filament_presets.push_back(this->filament_presets[ams_filament_presets.size()]);
             ams_filament_colors.push_back(filament_color);

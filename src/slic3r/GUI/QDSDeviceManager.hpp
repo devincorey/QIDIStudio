@@ -9,6 +9,7 @@
 #include <mutex>
 #include <functional>
 #include <thread>
+#include <cstdint>
 #include <atomic>
 #include <vector>
 #include <chrono>
@@ -20,6 +21,7 @@
 
 #include "nlohmann/json.hpp"
 #include "libslic3r/GCode/ThumbnailData.hpp"
+#include "DeviceCore/QDSBoxSync.hpp"
 
 using namespace nlohmann;
 
@@ -148,7 +150,9 @@ class QDSDevice{
 public:
     struct Filament {
         bool hasMaterial{ false };
-        int filament_idex;
+        int filament_idex{-1};
+        int vendor_index{-1};
+        int colour_index{-1};
         std::string name;
         std::string vendor;
         std::string colorHexCode;
@@ -157,6 +161,23 @@ public:
         int boxMinTemp;
         int boxMaxTemp;
         std::string type;
+    };
+    struct BoxSyncState {
+        QDSBoxSync::BoxSnapshotInput snapshot_input;
+        bool                         auto_reload_detect{false};
+        bool                         ready{false};
+        std::uint64_t                generation{0};
+    };
+    struct BoxMappingState {
+        bool                     ready{false};
+        int                      box_count{0};
+        QDSBoxSync::BoxSnapshot snapshot;
+        std::vector<std::string> filament_colors;
+        std::vector<std::string> filament_type;
+        std::vector<std::string> filament_id;
+        std::vector<int>         slot_id;
+        std::vector<int>         slot_state;
+        std::uint64_t            generation{0};
     };
 public:
     QDSDevice(const std::string dev_id, const std::string& dev_name, const std::string& dev_ip, const std::string& dev_url, const std::string& dev_type);
@@ -167,8 +188,22 @@ public:
     bool is_online();
     void updateFilamentConfig();    //When "m_frp_url" is updated, update the config file.
 
-    void updateBoxDataByJson(const json status);
+    void updateBoxDataByJson(const json &status);
     std::vector<float> getNozzleDiameter();
+    bool setReportedNozzleDiameters(std::vector<float> diameters);
+    bool setReportedNozzleDiametersFromJson(const json &value);
+    void resetReportedNozzleMetadata();
+    void resetBoxSyncState();
+    QDSBoxSync::PrinterMetadata getPrinterMetadata();
+    BoxSyncState getBoxSyncState();
+    BoxMappingState getBoxMappingState();
+    bool publishBoxMappingState(const QDSBoxSync::BoxSnapshot &snapshot,
+                                const std::vector<std::string> &filament_colors,
+                                const std::vector<std::string> &filament_type,
+                                const std::vector<std::string> &filament_id,
+                                const std::vector<int> &slot_id,
+                                const std::vector<int> &slot_state,
+                                std::uint64_t expected_generation);
     void reset_update_status(){
         box_is_update = true;
     };
@@ -231,6 +266,8 @@ public:
 
     //y78
     std::vector<float> m_nozzle_diameter { 0.4f };
+    bool m_has_reported_nozzle_diameter{ false };
+    bool m_reported_nozzle_metadata_valid{ false };
 
 
 	std::string     m_print_total_duration;
@@ -274,6 +311,13 @@ public:
     std::vector<std::string> m_filament_id;
     std::vector<int> m_slot_id;
     std::vector<int> m_slot_state;
+    QDSBoxSync::BoxSnapshotInput m_box_snapshot_input;
+    QDSBoxSync::BoxSnapshot      m_box_snapshot;
+    bool m_box_count_seen{false};
+    std::array<bool, QDSBoxSync::max_box_slots> m_box_slot_occupancy_seen{};
+    bool m_box_snapshot_ready{false};
+    bool m_box_mapping_ready{false};
+    std::uint64_t m_box_snapshot_generation{0};
 
     //cj_2 print model data
 
@@ -392,7 +436,9 @@ public:
     void setNetDevices(std::vector<NetDevice> devices);
     std::vector<NetDevice> getNetDevices();
 #endif
-    void upBoxInfoToBoxMsg(std::shared_ptr<QDSDevice>& device);
+    bool upBoxInfoToBoxMsg(std::shared_ptr<QDSDevice>& device);
+    QDSBoxSync::PrinterMetadata getPrinterMetadataForCompatibility(
+        const std::shared_ptr<QDSDevice>& device) const;
     void getFileInfo(const std::string& device_id);
     void resetBoxUpdateStatus(const std::string& device_id);
 

@@ -716,25 +716,16 @@ void QDSPrinterWebView::TransitionToCloudDevice(const NetDevice& device, DeviceB
                     if (resultJson.contains("data") && resultJson["data"].is_object()) {
                         if (resultJson["data"].contains("printing.polar_cooler") && resultJson["data"]["printing.polar_cooler"].is_string()) {
                             std::shared_ptr<QDSDevice> tempQdsDev = m_device_manager->getDevice(device.mac_address);
-                            tempQdsDev->m_enable_polar_cooler = resultJson["data"]["printing.polar_cooler"].get<std::string>() == "1";
+                            if (tempQdsDev)
+                                tempQdsDev->m_enable_polar_cooler = resultJson["data"]["printing.polar_cooler"].get<std::string>() == "1";
                         }
 
                         if (resultJson["data"].contains("nozzle.diameter")) {
                             std::shared_ptr<QDSDevice> tempQdsDev = m_device_manager->getDevice(device.mac_address);
-                            tempQdsDev->m_nozzle_diameter.clear();
-                            std::vector<float> nozzle_diameter_temp;
-                            if (resultJson["data"]["nozzle.diameter"].is_string()) {
-                                nozzle_diameter_temp.push_back(std::stof(resultJson["data"]["nozzle.diameter"].get<std::string>()));
-                                tempQdsDev->m_nozzle_diameter = nozzle_diameter_temp;
-                            }
-                            else if (resultJson["data"]["nozzle.diameter"].is_array()) {
-                                for (const auto& item : resultJson["data"]["nozzle.diameter"]) {
-                                    if (item.is_string()) {
-                                        nozzle_diameter_temp.push_back(std::stof(item.get<std::string>()));
-                                    }
-                                }
-                                tempQdsDev->m_nozzle_diameter = nozzle_diameter_temp;
-                            }
+                            if (!tempQdsDev)
+                                continue;
+                            if (!tempQdsDev->setReportedNozzleDiametersFromJson(resultJson["data"]["nozzle.diameter"]))
+                                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": cloud printer returned invalid or empty nozzle metadata";
                         }
                     }
                 }

@@ -22,6 +22,7 @@
 #include <wx/spinctrl.h>
 #include <wx/artprov.h>
 #include <wx/wrapsizer.h>
+#include <wx/weakref.h>
 
 #include "GUI_Utils.hpp"
 #include "wxExtensions.hpp"
@@ -37,6 +38,7 @@
 #include "Widgets/PopupWindow.hpp"
 #include <wx/simplebook.h>
 #include <wx/hashmap.h>
+#include <unordered_set>
 
 #include "slic3r/GUI/DeviceCore/DevUtil.h"
 
@@ -83,6 +85,7 @@ struct TrayData
     int             remain = MAPPING_ITEM_INVALID_REMAIN;
     std::string     name;
     std::string     filament_type;
+    std::string     filament_preset_id;
     wxColour        colour;
     std::vector<wxColour> material_cols = std::vector<wxColour>();
 
@@ -109,6 +112,8 @@ public:
                       bool record_back_info = false);
 
     void set_material_cols(int ctype, const std::vector<wxColour>& cols);
+    void set_material_display(wxColour col, int ctype, const std::vector<wxColour>& cols);
+    void restore_material_display();
 
     void reset_ams_info();
     virtual void reset_valid_info();
@@ -149,6 +154,12 @@ public:
     wxString              m_back_ams_name;
     int                   m_back_ams_ctype = 0;
     std::vector<wxColour> m_back_ams_cols  = std::vector<wxColour>();
+
+    // Preserve the sliced project's visual identity separately from the
+    // effective Box slot colour shown after a QDS mapping is selected.
+    wxColour              m_project_material_colour;
+    int                   m_project_material_ctype = 0;
+    std::vector<wxColour> m_project_material_cols;
 
     ScalableBitmap m_arraw_bitmap_gray;
     ScalableBitmap m_arraw_bitmap_white;
@@ -203,7 +214,7 @@ public:
 
 public:
     void update_data(TrayData data);
-    void send_event(int fliament_id);
+    bool send_event(int fliament_id);
     void set_data(const wxString& tag_name, wxColour colour, wxString name, bool remain_detect, TrayData data, bool unmatch = false, std::optional<wxString> tooltip_opt = std::nullopt);
     void set_checked(bool checked);
     void set_tray_index(wxString t_index) { m_tray_index = t_index; };
@@ -279,9 +290,9 @@ class AmsMapingPopup : public PopupWindow
 
 public:
     AmsMapingPopup(wxWindow *parent,bool use_in_sync_dialog = false);
-    ~AmsMapingPopup() {};
+    ~AmsMapingPopup() override;
 
-    MaterialItem* m_parent_item{ nullptr };
+    wxWeakRef<MaterialItem> m_parent_item;
 
     wxWindow* send_win{ nullptr };
     std::vector<std::string> m_materials_list;
@@ -289,10 +300,15 @@ public:
     std::vector<MappingContainer*> m_amsmapping_container_list;
     std::vector<MappingItem*> m_mapping_item_list;
 
+    MappingItem* find_mapping_item(int tray_id, int ams_id, int slot_id) const;
+
     bool        m_has_unmatch_filament {false};
+    bool        m_has_external_spool{false};
+    std::unordered_set<MappingItem *> m_bound_external_items;
     int         m_current_filament_id;
     ShowType    m_show_type{ShowType::RIGHT};
     std::string m_tag_material;
+    std::string m_tag_filament_id;
     wxScrolledWindow *m_scrolled_window{nullptr};
     wxBoxSizer *m_sizer_main{nullptr};
     wxBoxSizer *m_sizer_main_h{nullptr};
@@ -336,6 +352,7 @@ public:
     void         set_send_win(wxWindow* win) {send_win = win;};
     void         update_materials_list(std::vector<std::string> list);
     void         set_tag_texture(std::string texture);
+    void         set_tag_filament_id(const std::string &filament_id) { m_tag_filament_id = filament_id; }
     //y80
     void         update(MachineObject* obj, const std::vector<FilamentInfo>& ams_mapping_result, std::shared_ptr<QDSDevice> qds_obj=nullptr, bool use_dynamic_switch = false, std::optional<PrintFromType> print_type = std::nullopt, std::string dev_id = "");
     void         update_rack_select(MachineObject* obj, bool use_dynamic_switch, std::optional<PrintFromType> print_type);
@@ -346,11 +363,13 @@ public:
     void         set_current_filament_id(int id) { m_current_filament_id = id; };
     int          get_current_filament_id(){return m_current_filament_id;};
     bool         is_match_material(std::string material) const;
+    bool         is_match_filament(const TrayData &tray_data, bool enforce_material = true) const;
     void         on_left_down(wxMouseEvent &evt);
+    void         Dismiss() wxOVERRIDE;
     virtual void OnDismiss() wxOVERRIDE;
     virtual bool ProcessLeftDown(wxMouseEvent &event) wxOVERRIDE;
     void         paintEvent(wxPaintEvent &evt);
-    void         set_parent_item(MaterialItem* item) {m_parent_item = item;};
+    void         set_parent_item(MaterialItem* item);
     void         set_show_type(ShowType type) { m_show_type = type; };
 
 #ifdef __APPLE__
@@ -372,6 +391,8 @@ public:
     void EnableExtMappingFilaTypeCheck(bool to_check = true) { m_ext_mapping_filatype_check = to_check;} ;
 
 private:
+    void clear_parent_item_selection();
+
     // update
     void update_title(MachineObject* obj);
     void update_ams_tips(MachineObject* obj);
@@ -381,6 +402,9 @@ private:
     // events
     void OnNozzleMappingSelected(wxCommandEvent& evt);
     void update_flush_waste(MachineObject* obj);
+#ifdef __APPLE__
+    void destroy_tip_popup();
+#endif
 
 private:
     std::weak_ptr<DevNozzleRack> m_rack;
