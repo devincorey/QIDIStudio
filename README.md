@@ -25,7 +25,7 @@ The current `GeekCraft 02.07.02.60-gc.9` release has the following provenance:
 | --- | --- |
 | Upstream release | `QIDIStudio v2.07.02.60` |
 | Upstream commit | `c58fdc56629005395a672cb4e8713018a087df1b` |
-| Patched source commit | `5365f488da91070c422db059999507531d961438` |
+| Patched source commit | `5365f48848c2c251182dd51e2489a6ca30c9d827` |
 | Build system | macOS 27.0 beta (`26A5416b`), macOS SDK 27.0 |
 | Compiler | Apple clang 21.0.0 |
 | Architecture | Apple Silicon (`arm64`) |
