@@ -2,6 +2,16 @@
 
 # GeekCraft QIDIStudio for Apple Silicon
 
+> [!IMPORTANT]
+> **Project status: no longer maintained or supported.**
+>
+> I have moved to [OrcaSlicer](https://github.com/OrcaSlicer/OrcaSlicer),
+> which ships native QIDI X-Plus 4 profiles and is now my recommended slicer for
+> this printer. OrcaSlicer is more actively maintained and receives ongoing
+> updates and bug fixes. No further fixes, builds, releases, or user support are
+> planned for this QIDIStudio fork. Its existing source and releases remain
+> available as-is for historical reference.
+
 This is an **unofficial, community-maintained fork** of
 [QIDITECH/QIDIStudio](https://github.com/QIDITECH/QIDIStudio). It publishes a
 native Apple Silicon build of QIDIStudio and carries a focused patch stack for
